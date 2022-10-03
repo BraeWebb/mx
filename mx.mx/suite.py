@@ -819,6 +819,16 @@ suite = {
       "checkstyle" : "com.oracle.mxtool.junit",
     },
 
+    "com.oracle.mxtool.veriopt" : {
+      "subDir" : "java",
+      "sourceDirs" : ["src"],
+      "dependencies" : [
+          "CHECKSTYLE_8.36.1",
+      ],
+      "javaCompliance" : "1.8+",
+      "checkstyle" : "com.oracle.mxtool.junit",
+    },
+
     "com.oracle.mxtool.jacoco" : {
       "subDir" : "java",
       "sourceDirs" : ["src"],
@@ -882,6 +892,13 @@ suite = {
       "moduleInfo" : {
         "name" : "com.oracle.mxtool.junit",
       },
+    },
+
+    "CHECKSTYLE" : {
+      "subDir" : "java",
+      "dependencies" : [
+        "com.oracle.mxtool.veriopt",
+      ],
     },
 
     "MX_JACOCO_REPORT" : {

@@ -15768,12 +15768,14 @@ def checkstyle(args):
             continue
         config, checkstyleVersion = key
         checkstyleLibrary = library('CHECKSTYLE_' + checkstyleVersion).get_path(True)
+        checkstyleCp = classpath(['CHECKSTYLE'])
+        print(checkstyleCp)
         auditfileName = join(batch.suite.dir, 'checkstyleOutput.txt')
         log('Running Checkstyle [{0}] on {1} using {2}...'.format(checkstyleVersion, ', '.join([p.name for p in batch.projects]), config))
         try:
             for chunk in _chunk_files_for_command_line(batch.sources):
                 try:
-                    run_java(['-Xmx1g', '-jar', checkstyleLibrary, '-f', 'xml', '-c', config, '-o', auditfileName] + chunk, nonZeroIsFatal=False)
+                    run_java(['-Xmx1g', '-cp', checkstyleCp, 'com.puppycrawl.tools.checkstyle.Main', '-f', 'xml', '-c', config, '-o', auditfileName] + chunk, nonZeroIsFatal=False)
                 finally:
                     if exists(auditfileName):
                         errors = []
