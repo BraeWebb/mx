@@ -343,7 +343,7 @@ class NinjaProject(MultiarchProject):
         return NinjaBuildTask(args, self, target_arch)
 
     @abc.abstractmethod
-    def generate_manifest(self, path):
+    def generate_manifest(self, output_dir, filename):
         """Generates a Ninja manifest used to build this project."""
 
     @property
@@ -425,7 +425,9 @@ class NinjaBuildTask(TargetArchBuildTask):
                 or mx.basename(self._manifest) in self._reason \
                 or 'phony' in self._reason:
             with mx.SafeFileCreation(self._manifest) as sfc:
-                self.subject.generate_manifest(sfc.tmpPath)
+                output_dir = os.path.dirname(sfc.tmpPath)
+                tmpfilename = os.path.basename(sfc.tmpPath)
+                self.subject.generate_manifest(output_dir, tmpfilename)
 
                 if mx.exists(self._manifest) \
                         and not filecmp.cmp(self._manifest, sfc.tmpPath, shallow=False):
@@ -454,10 +456,11 @@ class NinjaManifestGenerator(object):
     For more details about Ninja, see https://ninja-build.org/manual.html.
     """
 
-    def __init__(self, project, output):
+    def __init__(self, project, output_dir, filename):
         import ninja_syntax
         self.project = project
-        self.n = ninja_syntax.Writer(output)  # pylint: disable=invalid-name
+        self.output_dir = output_dir
+        self.n = ninja_syntax.Writer(open(os.path.join(output_dir, filename), 'w'))  # pylint: disable=invalid-name
         self._generate()
 
     def __enter__(self):
@@ -529,7 +532,8 @@ class NinjaManifestGenerator(object):
         self.variables(ninja_required_version='1.3')
 
         self.comment('Directories')
-        self.variables(project=self.project.dir)
+        # must be relativ, otherwise doesn't compose with -fdebug-prefix-map=
+        self.variables(project=os.path.relpath(self.project.dir, start=self.output_dir))
 
         self._generate_mx_interface()
 
@@ -585,6 +589,7 @@ class DefaultNativeProject(NinjaProject):
     """
     include = 'include'
     src = 'src'
+    _isObjcSelectorWorkaroundNeeded = None
 
     _kinds = dict(
         static_lib=dict(
@@ -631,6 +636,7 @@ class DefaultNativeProject(NinjaProject):
 
     @property
     def cflags(self):
+        super_cflags = super(DefaultNativeProject, self).cflags
         default_cflags = []
         if self._kind == self._kinds['shared_lib']:
             default_cflags += dict(
@@ -649,7 +655,22 @@ class DefaultNativeProject(NinjaProject):
             default_cflags += [add_debug_prefix(_get_target_jdk().home)]
             default_cflags += ['-gno-record-gcc-switches']
 
-        return default_cflags + super(DefaultNativeProject, self).cflags
+            if mx.get_os() == 'darwin':
+                # Workaround for GR-41115
+                #
+                # > ld: Assertion failed: (dylib != NULL), function classicOrdinalForProxy, file LinkEditClassic.hpp
+                #
+                # Apple introduced an optimization for msgSend in ObjC in Xcode14. Alas this seems to trigger
+                # a linker assert (see above) under certain conditions, that happens in SubstrateVM. Thus disable
+                # it for now if we build with a Xcode version that knows this flag.
+                if self._isObjcSelectorWorkaroundNeeded is None:
+                    rc = mx.run('clang -E -fno-objc-msgsend-selector-stubs /dev/null'.split(' '), out=mx.OutputCapture(), err=mx.OutputCapture(), nonZeroIsFatal=False)
+                    self._isObjcSelectorWorkaroundNeeded = rc == 0
+
+                if self._isObjcSelectorWorkaroundNeeded and '-ObjC' in super_cflags:
+                    default_cflags += ['-fno-objc-msgsend-selector-stubs']
+
+        return default_cflags + super_cflags
 
     @property
     def ldflags(self):
@@ -678,12 +699,12 @@ class DefaultNativeProject(NinjaProject):
     def asm_sources(self):
         return self._source['files'].get('.S', [])
 
-    def generate_manifest(self, path):
-        unsupported_source_files = list(set(self._source['files'].keys()) - {'.h', '.c', '.cc', '.S'})
+    def generate_manifest(self, output_dir, filename):
+        unsupported_source_files = list(set(self._source['files'].keys()) - {'.h', '.c', '.cc', '.S', '.swp'})
         if unsupported_source_files:
             mx.abort('{} source files are not supported by default native projects'.format(unsupported_source_files))
 
-        with NinjaManifestGenerator(self, open(path, 'w')) as gen:
+        with NinjaManifestGenerator(self, output_dir, filename) as gen:
             gen.comment("Toolchain configuration")
             gen.include(mx.join(self.toolchain.get_output(), 'toolchain.ninja'))
             gen.newline()
