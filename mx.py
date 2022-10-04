@@ -15767,8 +15767,8 @@ def checkstyle(args):
             continue
         config, checkstyleVersion = key
         checkstyleLibrary = library('CHECKSTYLE_' + checkstyleVersion).get_path(True)
+        build(['--no-daemon', '--dependencies', 'CHECKSTYLE'])
         checkstyleCp = classpath(['CHECKSTYLE'])
-        print(checkstyleCp)
         auditfileName = join(batch.suite.dir, 'checkstyleOutput.txt')
         log('Running Checkstyle [{0}] on {1} using {2}...'.format(checkstyleVersion, ', '.join([p.name for p in batch.projects]), config))
         try:
