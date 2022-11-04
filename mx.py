@@ -30,6 +30,7 @@ mx is a command line tool for managing the development of Java code organized as
 """
 
 import sys
+import uuid
 from abc import ABCMeta, abstractmethod, abstractproperty
 
 if __name__ == '__main__':
@@ -11295,15 +11296,7 @@ def _deploy_skip_existing(args, dists, version, repo):
         return dists
 
 
-def _deploy_artifact(uploader, dist, path, version, jdk, platform, suite_revisions, artifact_repo_key,
-                     skip_existing=False, dry_run=False):
-
-    def get_artifact_name(project_prefix, artifact_id, artifact_version, extension, is_release):
-        import uuid
-        if is_release:
-            return "{}/{}-{}.{}".format(project_prefix, artifact_id, artifact_version, extension)
-        return "{}/{}-{}-{}.{}".format(project_prefix, artifact_id, artifact_version, uuid.uuid4(), extension)
-
+def _deploy_artifact(uploader, dist, path, version, jdk, platform, suite_revisions, skip_existing=False, dry_run=False):
     assert exists(path), "{} does not exist".format(path)
     maven_artifact_id = dist.maven_artifact_id(platform)
     dist_metadata = dist.get_artifact_metadata()
@@ -11334,12 +11327,12 @@ def _deploy_artifact(uploader, dist, path, version, jdk, platform, suite_revisio
     suite_revision_file = dump_metadata_json(suite_revisions, "suiteRevisions")
     extra_metadata_file = dump_metadata_json(extra_metadata, "extraMetadata")
 
-    cmd = ["python", uploader, "--version", version, "--revision", dist.suite.vc.parent(dist.suite.vc_dir),
+    cmd = [uploader, "--version", version, "--revision", dist.suite.vc.parent(dist.suite.vc_dir),
            "--suite-revisions", suite_revision_file,
            "--extra-metadata", extra_metadata_file,
            "--lifecycle", "release" if dist.suite.is_release() else "snapshot",
            path,
-           get_artifact_name(project, maven_artifact_id, version, dist.remoteExtension(), dist.suite.is_release()),
+           "{}/{}-{}.{}".format(project, maven_artifact_id, version, dist.remoteExtension()),
            project]
     if edition:
         cmd.extend(["--edition", edition])
@@ -11351,8 +11344,6 @@ def _deploy_artifact(uploader, dist, path, version, jdk, platform, suite_revisio
         cmd.extend(["--platform", platform])
     if skip_existing:
         cmd.append("--skip-existing")
-    if artifact_repo_key:
-        cmd.extend(["--artifact-repo-key", artifact_repo_key])
     log("Uploading {}:{}".format(dist.maven_group_id(), dist.maven_artifact_id(platform)))
     try:
         if not dry_run:
@@ -11631,7 +11622,7 @@ def _maven_deploy_dists(dists, versionGetter, repo, settingsXml,
         os.unlink(repo_metadata_name)
 
 
-def _deploy_dists(uploader, dists, version_getter, artifact_repo_key, skip_existing=False, dry_run=False):
+def _deploy_dists(uploader, dists, version_getter, skip_existing=False, dry_run=False):
     related_suites_revisions = [{"suite": s_.name, "revision": s_.vc.parent(s_.vc_dir)} for s_ in suites() if s_.vc]
     if _opts.very_verbose or (dry_run and _opts.verbose):
         log(related_suites_revisions)
@@ -11648,7 +11639,6 @@ def _deploy_dists(uploader, dists, version_getter, artifact_repo_key, skip_exist
                              platform=Distribution.platformName().replace("_", "-"),
                              suite_revisions=related_suites_revisions,
                              skip_existing=skip_existing,
-                             artifact_repo_key=artifact_repo_key,
                              dry_run=dry_run)
         finally:
             if pushed_file != to_deploy:
@@ -11794,14 +11784,15 @@ def deploy_artifacts(args):
     parser.add_argument('--skip-existing', action='store_true', help='Do not deploy distributions if already in repository')
     parser.add_argument('--version-string', action='store', help='Provide custom version string for deployment')
     parser.add_argument('--tags', help='Comma-separated list of tags to match in the maven metadata of the distribution. When left unspecified, no filtering is done. The default tag is \'default\'', default=None)
-    parser.add_argument('--artifact-repo-key', help='Artifact repo api key file', metavar='FILE')
     parser.add_argument('--uploader', action='store', help='Uploader')
     args = parser.parse_args(args)
+
+    snapshot_id = uuid.uuid4()
 
     def versionGetter(suite):
         if args.version_string:
             return args.version_string
-        return suite.release_version(snapshotSuffix='SNAPSHOT')
+        return suite.release_version(snapshotSuffix='SNAPSHOT-' + str(snapshot_id))
 
     if args.all_suites:
         _suites = suites()
@@ -11821,8 +11812,7 @@ def deploy_artifacts(args):
                 abort("'{0}' is not built, run 'mx build' first".format(dist.name))
 
         log('Deploying {} distributions for version {}'.format(s.name, versionGetter(s)))
-        _deploy_dists(dists=dists, version_getter=versionGetter, uploader=args.uploader, skip_existing=args.skip_existing,
-                      artifact_repo_key=args.artifact_repo_key, dry_run=args.dry_run)
+        _deploy_dists(dists=dists, version_getter=versionGetter, uploader=args.uploader, skip_existing=args.skip_existing, dry_run=args.dry_run)
         has_deployed_dist = True
     if not has_deployed_dist:
         abort("No distribution was deployed!")
@@ -13898,6 +13888,8 @@ class JDKConfig(Comparable):
             if any(arg.startswith('-javaagent') and agent_path in arg for arg in args):
                 return []
             # jacoco flags might change in-process -> do not cache
+            if self.javaCompliance.value < 9:
+                abort('Using jacoco agent only supported on JDK 9+ as it requires Java Command-Line argument files')
             return mx_gate.get_jacoco_agent_args() or []
 
         if addDefaultArgs:
@@ -17779,6 +17771,7 @@ update_commands("mx", {
     'java': [java_command, '[-options] class [args...]'],
     'javadoc': [javadoc, '[options]'],
     'javap': [javap, '[options] <class name patterns>'],
+    'lcov-report' : [mx_gate.lcov_report, '[options]'],
     'maven-deploy' : [maven_deploy, ''],
     'maven-install' : [maven_install, ''],
     'maven-url': [maven_url, '<repository id> <distribution name>'],
@@ -18097,7 +18090,7 @@ def main():
         abort(1, killsig=signal.SIGINT)
 
 # The version must be updated for every PR (checked in CI)
-version = VersionSpec("6.9.5") # [GR-41390] Replace pipes library use with shlex
+version = VersionSpec("6.10.1") # [GR-42223] Use the same snapshot id for all suites
 
 currentUmask = None
 _mx_start_datetime = datetime.utcnow()
