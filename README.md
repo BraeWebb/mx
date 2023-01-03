@@ -525,13 +525,13 @@ Further details are [here](README-proftool.md).
 ### URL rewriting
 
 Mx includes support for the primary suite to be able to override the source URLs of imported suites.
-The suite level `urlrewrites` attribute allows regular expression URL rewriting, and, optionally, SHA1 rewriting. For example:
+The suite level `urlrewrites` attribute allows regular expression URL rewriting, and, optionally, digest rewriting. For example:
 ```
   "urlrewrites" : [
     {
       "https://git.acme.com/(.*).git" : {
         "replacement" : r”https://my.company.com/foo-git-cache/\1.git",
-        "sha1" : "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        "digest" : "sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709",
       }
     },
     {
@@ -552,7 +552,7 @@ Rewrites rules specified by `MX_URLREWRITES` are applied after rules specified b
 
 Mx supports generating IDE configurations using the `mx ideinit` command.
 There are also specific commands that generate configurations for Eclipse (`mx eclipseinit`), Netbeans (`mx netbeansinit`) or IntelliJ (`mx intellijinit`) individually.
-Please see [here](https://github.com/graalvm/mx/docs/IDE.md) for details.
+Please see [here](docs/IDE.md) for details.
 
 ### Environment variable processing
 
@@ -595,3 +595,92 @@ In other words, there should be no back-and-forth to the same repo.
 Java projects may use language or runtime features which are considered _preview features_ in certain Java versions, in which case preview features must be enabled for compilation (`--enable-preview`).
 This is specified using the `javaPreviewNeeded` attribute, which is a version specification in the same format as `javaCompliance`, for example: `"javaPreviewNeeded": "19..20"`
 If the compiling JDK matches that version or version range, preview features are enabled for compilation.
+Given that javac and the JVM must be on the same JDK version for preview features (see [here](https://nipafx.dev/enable-preview-language-features/#same-version-for-feature-compiler-and-jvm) for details),
+compiling a project with preview features will force the javac `-source` and `-target` options to `N` where `N` is
+the minimum of:
+* the version of the JDK being used for compilation (i.e. `JAVA_HOME`) and
+* the lowest version where `--enable-preview` is not needed.
+
+The following table of examples should make this clearer:
+
+| JDK | javaPreviewNeeded | -target / -source | --enable-preview |
+| ----|-------------------|-------------------|------------------|
+| 19  | 19+               | 19                | Yes              |
+| 20  | 19+               | 20                | Yes              |
+| 20  | 19                | 20                | No               |
+| 21  | 19                | 20                | No               |
+| 22  | 20                | 21                | No               |
+| 22  | 19..20            | 21                | No               |
+
+### System dependent configuration
+
+A project can specify system dependent configuration options depending on which
+operating system and architecture are in use. The following example shows how
+the `bar` property can be set to `A` on Windows and `B` on all other operating
+systems.
+
+```python
+"project" : {
+  "foo" : "A",
+  "os" : {
+    "windows" : {
+      "bar" : "A"
+    },
+    "<others>" : {
+      "bar" : "B"
+    }
+  }
+}
+```
+
+Commonly supported operating system names are `darwin`, `linux` and `windows`.
+The `<others>` value can be used as a wildcard to match any other operating
+system. A warning is emitted if no operating system is matched.
+
+The `arch` property can be used to alter the configuration depending on which
+system architecture is used. Common examples of examples of system architectures
+are `amd64` and `aarch64`. The following example shows how the `bar` property
+can be set to `A` on amd64 and to `B` on all other platforms.
+
+```python
+"project" : {
+  "foo" : "A",
+  "arch" : {
+    "amd64" : {
+      "bar" : "A"
+    },
+    "<others>" : {
+      "bar" : "B"
+    }
+  }
+}
+```
+
+Configuration options that should depend on both the operating system and the
+architecture value can be specified using the `os_arch` property as follows. The
+following configuration example sets the property `bar` to `A` on amd64 linux
+systems, and to `B` for all other systems.
+
+```python
+"project" : {
+  "foo" : "A",
+  "os_arch" : {
+    "linux" : {
+      "amd64" : {
+        "bar" : "A"
+      },
+      "<others>" : {
+        "bar" : "B"
+      }
+    },
+    "<others>" : {
+      "<others>" : {
+        "bar" : "B"
+      }
+    }
+  }
+}
+```
+
+It is only possible to specify one of either the `os`, `arch` or `os_arch`
+options for any project.

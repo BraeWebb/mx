@@ -48,6 +48,7 @@ class CMakeNinjaProject(mx_native.NinjaProject):  # pylint: disable=too-many-anc
     def __init__(self, suite, name, deps, workingSets, subDir, ninja_targets=None, ninja_install_targets=None,
                  cmake_show_warnings=True, results=None, output=None, **args):
         projectDir = args.pop('dir', None)
+        self._cmake_toolchain = args.pop('toolchain', None)
         if projectDir:
             d_rel = projectDir
         elif subDir is None:
@@ -64,6 +65,14 @@ class CMakeNinjaProject(mx_native.NinjaProject):  # pylint: disable=too-many-anc
         super(CMakeNinjaProject, self).__init__(suite, name, subDir, [srcDir], deps, workingSets, d, results=results, output=output, **args)
         self.silent = not cmake_show_warnings
         self._cmake_config_raw = args.pop('cmakeConfig', {})
+        if self._cmake_toolchain:
+            self.buildDependencies += [self._cmake_toolchain]
+
+    def resolveDeps(self):
+        super(CMakeNinjaProject, self).resolveDeps()
+        self._cmake_toolchain = mx.distribution(self._cmake_toolchain, context=self) if self._cmake_toolchain else None
+        if self._cmake_toolchain and (not isinstance(self._cmake_toolchain, mx.AbstractDistribution) or not self._cmake_toolchain.get_output()):
+            mx.abort(f"Cannot generate manifest: the specified toolchain ({self._cmake_toolchain}) must be an AbstractDistribution that returns a value for get_output", context=self)
 
     @staticmethod
     def config_entry(key, value):
@@ -71,7 +80,7 @@ class CMakeNinjaProject(mx_native.NinjaProject):  # pylint: disable=too-many-anc
         if mx.is_windows():
             # cmake does not like backslashes
             value_substitute = value_substitute.replace("\\", "/")
-        return '-D{}={}'.format(key, value_substitute)
+        return f'-D{key}={value_substitute}'
 
     @staticmethod
     def check_cmake():
@@ -95,8 +104,11 @@ class CMakeNinjaProject(mx_native.NinjaProject):  # pylint: disable=too-many-anc
                         mx.log_error(err.data)
                     raise
 
+    def _toolchain_config(self):
+        return {"CMAKE_TOOLCHAIN_FILE": mx.join(tc.get_output(), 'cmake', 'toolchain.cmake') for tc in [self._cmake_toolchain] if tc}
+
     def cmake_config(self):
-        return [CMakeNinjaProject.config_entry(k, v) for k, v in sorted(self._cmake_config_raw.items())]
+        return [CMakeNinjaProject.config_entry(k, v) for k, v in sorted({**self._cmake_config_raw, **self._toolchain_config()}.items())]
 
     def generate_manifest(self, output_dir, filename, extra_cmake_config=None):
         source_dir = self.source_dirs()[0]
@@ -150,10 +162,10 @@ class CMakeNinjaBuildTask(mx_native.NinjaBuildTask):
                                                self.name)
 
     def needsBuild(self, newestInput):
-        mx.logv('Checking whether to reconfigure {} with CMake'.format(self.subject.name))
+        mx.logv(f'Checking whether to reconfigure {self.subject.name} with CMake')
         need_configure, reason = self._need_configure()
         if need_configure:
-            return need_configure, "reconfigure needed by CMake ({})".format(reason)
+            return need_configure, f"reconfigure needed by CMake ({reason})"
         return super(CMakeNinjaBuildTask, self).needsBuild(newestInput)
 
     def build(self):

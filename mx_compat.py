@@ -153,7 +153,7 @@ class MxCompatibility500(object):
         return False
 
     def __str__(self):
-        return str("MxCompatibility({})".format(self.version()))
+        return str(f"MxCompatibility({self.version()})")
 
     def __repr__(self):
         return str(self)
@@ -659,6 +659,13 @@ class MxCompatibility691(MxCompatibility680):
             'RETRACE': '7_3_0_beta1',
         }
 
+class MxCompatibility6120(MxCompatibility691):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.12.0")
+
+    def spotbugs_version(self):
+        return "4.7.3"
 
 def minVersion():
     _ensureCompatLoaded()
