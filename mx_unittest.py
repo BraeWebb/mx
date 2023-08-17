@@ -348,7 +348,8 @@ def _unittest(args, annotations, junit_args, prefixCp="", blacklist=None, whitel
             prefixArgs.append('-XX:-DisableExplicitGC')
 
         jdk = vmLauncher.jdk()
-        vmArgs += mx.get_runtime_jvm_args(unittestDeps, cp_prefix=prefixCp+coreCp, jdk=jdk)
+        force_cp = '-JUnitForceClassPath' in junit_args
+        vmArgs += mx.get_runtime_jvm_args(unittestDeps, cp_prefix=prefixCp+coreCp, jdk=jdk, force_cp=force_cp)
 
         # suppress menubar and dock when running on Mac
         vmArgs = prefixArgs + ['-Djava.awt.headless=true'] + vmArgs
@@ -531,10 +532,11 @@ def unittest(args, test_report_tags=None):
     parser.add_argument('--blacklist', help='run all testcases not specified in <file>', metavar='<file>')
     parser.add_argument('--whitelist', help='run testcases specified in <file> only', metavar='<file>')
     parser.add_argument('--verbose', help='enable verbose JUnit output', dest='JUnitVerbose', action=MxJUnitWrapperBoolArg)
+    parser.add_argument('--force-classpath', help='forces all jars on the classpath', dest='JUnitForceClassPath', action=MxJUnitWrapperBoolArg)
     parser.add_argument('--very-verbose', help='enable very verbose JUnit output', dest='JUnitVeryVerbose', action=MxJUnitWrapperBoolArg)
     parser.add_argument('--max-class-failures', help='stop after N test classes that have a failure (default is no limit)', type=is_strictly_positive, metavar='<N>', dest='JUnitMaxClassFailures', action=MxJUnitWrapperArg)
     parser.add_argument('--fail-fast', help='alias for --max-class-failures=1', dest='JUnitFailFast', action=MxJUnitWrapperBoolArg)
-    parser.add_argument('--enable-timing', help='enable JUnit test timing (requires --verbose/--very-verbose)', dest='JUnitEnableTiming', action=MxJUnitWrapperBoolArg)
+    parser.add_argument('--enable-timing', help='enable JUnit test timing (always on - option retained for compatibility)', dest='JUnitEnableTiming', action=MxJUnitWrapperBoolArg)
     parser.add_argument('--regex', help='run only testcases matching a regular expression', metavar='<regex>')
     parser.add_argument('--color', help='enable color output', dest='JUnitColor', action=MxJUnitWrapperBoolArg)
     parser.add_argument('--gc-after-test', help='force a GC after each test', dest='JUnitGCAfterTest', action=MxJUnitWrapperBoolArg)
@@ -580,6 +582,9 @@ def unittest(args, test_report_tags=None):
         except IOError:
             mx.log('warning: could not read blacklist: ' + parsed_args.blacklist)
 
+    if '-JUnitEnableTiming' not in junit_args:
+        junit_args.append('-JUnitEnableTiming')
+
     if parsed_args.eager_stacktrace is None:
         junit_args.append('-JUnitEagerStackTrace')
     parsed_args.__dict__.pop('eager_stacktrace')
@@ -598,7 +603,10 @@ def unittest(args, test_report_tags=None):
         _unittest(args, ['@Test', '@Parameters'], junit_args, **parsed_args.__dict__)
         if make_test_report:
             import mx_gate
-            return mx_gate.make_test_report(test_results, tags=test_report_tags)
+            assert 'task' in test_report_tags, 'Task tag is mandatory'
+            task = test_report_tags['task']
+            test_report_tags.pop('task')
+            return mx_gate.make_test_report(test_results, task, tags=test_report_tags)
     except UnicodeDecodeError as e:
         mx.log(f"Cannot decode '{test_results}'")
         delete_test_results = False

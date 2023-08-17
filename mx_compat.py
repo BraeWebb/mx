@@ -282,6 +282,18 @@ class MxCompatibility500(object):
         """
         return False
 
+    def gate_spotbugs_strict_mode(self):
+        """
+        True if spotbugs mx gate --strict-mode should be propagated to spotbugs.
+        """
+        return False
+
+    def gate_strict_tags_and_tasks(self):
+        """
+        True if mx gate --tags and --task should fail if they do not match any task.
+        """
+        return False
+
 
 class MxCompatibility520(MxCompatibility500):
     @staticmethod
@@ -666,6 +678,77 @@ class MxCompatibility6120(MxCompatibility691):
 
     def spotbugs_version(self):
         return "4.7.3"
+
+class MxCompatibility6160(MxCompatibility6120):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.16.0")
+
+    def proguard_supported_jdk_version(self):
+        return 20
+
+    def proguard_libs(self):
+        return {
+            'BASE': '7_3_2_alpha',
+            'RETRACE': '7_3_2_alpha',
+        }
+
+class MxCompatibility6170(MxCompatibility6160):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.17.0")
+
+    def proguard_supported_jdk_version(self):
+        return 20
+
+    def proguard_libs(self):
+        return {
+            'BASE': '7_3_2',
+            'RETRACE': '7_3_2',
+        }
+
+class MxCompatibility6190(MxCompatibility6170):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.19.0")
+
+    def gate_spotbugs_strict_mode(self):
+        return True
+
+
+class MxCompatibility6240(MxCompatibility6190):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.24.0")
+
+    def gate_strict_tags_and_tasks(self):
+        return True
+
+
+class MxCompatibility6270(MxCompatibility6240):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.27.0")
+
+    def proguard_supported_jdk_version(self):
+        return 21
+
+    def proguard_libs(self):
+        return {
+            'CORE': '9_0_8_JDK21_BACKPORT',
+            'BASE': '7_3_2_JDK21_BACKPORT',
+            'RETRACE': '7_3_2',
+        }
+
+
+class MxCompatibility6271(MxCompatibility6270):
+    @staticmethod
+    def version():
+        return mx.VersionSpec("6.27.1")
+
+    def spotbugs_version(self):
+        return "4.7.3_JDK21_BACKPORT"
+
 
 def minVersion():
     _ensureCompatLoaded()

@@ -49,6 +49,17 @@ def _get_target_jdk():
 # Support for conditional compilation based on the JDK version.
 mx_subst.results_substitutions.register_no_arg('jdk_ver', lambda: str(_get_target_jdk().javaCompliance.value))
 
+# Support for inheriting toolchains.
+def _ninja_toolchain_path(toolchain):
+    dist = mx.distribution(toolchain)
+    path = os.path.join(dist.get_output(), 'toolchain.ninja')
+    # See ninja_syntax.escape_path
+    # Unfortunately, this could be used before ninja_syntax is loaded/loadable
+    path = path.replace('$ ', '$$ ').replace(' ', '$ ').replace(':', '$:')
+    return path
+
+mx_subst.path_substitutions.register_with_arg('ninja-toolchain', _ninja_toolchain_path)
+
 
 class lazy_default(object):  # pylint: disable=invalid-name
     def __init__(self, init):
@@ -525,8 +536,7 @@ class NinjaManifestGenerator(object):
         self.variables(ninja_required_version='1.3')
 
         self.comment('Directories')
-        # must be relativ, otherwise doesn't compose with -fdebug-prefix-map=
-        self.variables(project=os.path.relpath(self.project.dir, start=self.output_dir))
+        self.variables(project=self.project.dir)
 
         self._generate_mx_interface()
 
@@ -643,6 +653,7 @@ class DefaultNativeProject(NinjaProject):
                 return f'-fdebug-prefix-map={quote(prefix_dir)}={quote(mx.basename(prefix_dir))}'
 
             default_cflags += [add_debug_prefix(self.suite.vc_dir)]
+            default_cflags += [add_debug_prefix(self.suite.get_output_root())]
             default_cflags += [add_debug_prefix(_get_target_jdk().home)]
             default_cflags += ['-gno-record-gcc-switches']
 
@@ -688,7 +699,7 @@ class DefaultNativeProject(NinjaProject):
             if self._kind != self._kinds['static_lib']:
                 gen.variables(
                     ldflags=[mx_subst.path_substitutions.substitute(ldflag) for ldflag in self.ldflags],
-                    ldlibs=self.ldlibs,
+                    ldlibs=[mx_subst.path_substitutions.substitute(ldlib) for ldlib in self.ldlibs],
                 )
             gen.include_dirs(collections.OrderedDict.fromkeys(
                 # remove the duplicates while maintaining the ordering

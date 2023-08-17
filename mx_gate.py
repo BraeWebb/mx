@@ -38,6 +38,7 @@ from argparse import ArgumentParser
 from datetime import datetime, timezone, timedelta
 
 import mx
+import mx_util
 import mx_javacompliance
 import sys
 from mx_urlrewrites import rewriteurl
@@ -64,10 +65,13 @@ class Task:
     # a non-None value from __enter__. The body of a 'with Task(...) as t'
     # statement should check 't' and exit immediately if it is None.
     filters = []
-    log = True # whether to log task messages
+    strict_filters = []  # Like `filters`, but the entire title must match
+    log = True  # whether to log task messages
     dryRun = False
     startAtFilter = None
     filtersExclude = False
+
+    tasks = []
 
     tags = None
     tagsExclude = False
@@ -139,11 +143,19 @@ class Task:
                 else:
                     self.skipped = True
             elif len(Task.filters) > 0:
+                assert len(Task.strict_filters) == 0, "A Task cannot have both `filters` and `strict_filters`"
                 titles = [self.title] + self.legacyTitles
                 if Task.filtersExclude:
                     self.skipped = any([f in t for t in titles for f in Task.filters])
                 else:
                     self.skipped = not any([f in t for t in titles for f in Task.filters])
+            elif len(Task.strict_filters) > 0:
+                assert len(Task.filters) == 0, "A Task cannot have both `filters` and `strict_filters`"
+                titles = [self.title] + self.legacyTitles
+                if Task.filtersExclude:
+                    self.skipped = any([f == t for t in titles for f in Task.strict_filters])
+                else:
+                    self.skipped = not any([f == t for t in titles for f in Task.strict_filters])
             if Task.tags is not None:
                 if Task.tagsExclude:
                     self.skipped = all([t in Task.tags for t in self.tags]) if tags else False # pylint: disable=unsupported-membership-test
@@ -179,7 +191,7 @@ class Task:
                     'duration': str(self.duration)
                 }]
                 component = mx.primary_suite().name if self.report is True else str(self.report)
-                make_test_report(test_results, component=component, tags={'task' : self.title})
+                make_test_report(test_results, self.title, component=component)
 
     @staticmethod
     def _human_fmt(num):
@@ -320,7 +332,7 @@ def gate(args):
     add_omit_clean_args(parser)
     parser.add_argument('--all-suites', action='store_true', help='run gate tasks for all suites, not just the primary suite')
     parser.add_argument('--dry-run', action='store_true', help='just show the tasks that will be run without running them')
-    parser.add_argument('-x', action='store_true', help='makes --task-filter or --tags an exclusion instead of inclusion filter')
+    parser.add_argument('-x', action='store_true', help='makes --task-filter, --strict-task-filter, or --tags an exclusion instead of inclusion filter')
     jacoco = parser.add_mutually_exclusive_group()
     jacoco.add_argument('--jacocout', help='specify the output directory for jacoco report')
     jacoco.add_argument('--jacoco-zip', help='specify the output zip file for jacoco report')
@@ -337,6 +349,7 @@ def gate(args):
     summary.add_argument('--summary-format', dest='summary', action='store', default=None, help='--summary with a comma separated list of entries. Possible values ' + str(default_summary))
     filtering = parser.add_mutually_exclusive_group()
     filtering.add_argument('-t', '--task-filter', help='comma separated list of substrings to select subset of tasks to be run')
+    filtering.add_argument('-T', '--strict-task-filter', help='comma separated list of strings to select subset of tasks to be run. The entire task name must match.')
     filtering.add_argument('-s', '--start-at', help='substring to select starting task')
     filtering.add_argument('--tags', help='comma separated list of tags to select subset of tasks to be run. Tags can have a range specifier `name[:from:[to]]`.'
                            'If present only the [from,to) tasks are executed. If `to` is omitted all tasks starting with `from` are executed.')
@@ -353,6 +366,9 @@ def gate(args):
     elif args.task_filter:
         Task.filters = args.task_filter.split(',')
         Task.filtersExclude = args.x
+    elif args.strict_task_filter:
+        Task.strict_filters = args.strict_task_filter.split(',')
+        Task.filtersExclude = args.x
     elif args.tags:
         parse_tags_argument(args.tags, args.x)
         Task.tagsExclude = args.x
@@ -360,7 +376,7 @@ def gate(args):
             # implicitly include 'always'
             Task.tags += [Tags.always]
     elif args.x:
-        mx.abort('-x option cannot be used without --task-filter or the --tags option')
+        mx.abort('-x option cannot be used without --task-filter, --strict-task-filter, or the --tags option')
 
     if args.jacoco_zip:
         args.jacocout = 'html'
@@ -388,10 +404,14 @@ def gate(args):
         partialTasks = nonBuildTasks[selected::total]
         runTaskNames = [task.title for task in buildTasks + partialTasks]
 
-        # we have already ran the filters in the dry run when collecting
+        # We have already ran the filters in the dry run when collecting
         # so we can safely overwrite other filter settings.
-        Task.filters = runTaskNames
+        # We set `strict_filters` rather than `filters` because we want
+        # exact matches, not matches by substring.
+        Task.strict_filters = runTaskNames
+        Task.filters = []
         Task.filtersExclude = False
+        Task.tags = None
 
         mx.log('Running gate with partial tasks ' + args.partial + ". " + str(len(partialTasks)) + " out of " + str(len(nonBuildTasks)) + " non-build tasks selected.")
         if len(partialTasks) == 0:
@@ -448,6 +468,25 @@ def gate(args):
     try:
         mx._mx_commands.add_command_callback(mx_command_entered, mx_command_left)
         _run_gate(cleanArgs, args, tasks)
+        if mx.primary_suite().getMxCompatibility().gate_strict_tags_and_tasks():
+            if Task.tags is not None:
+                for tag in Task.tags:  # pylint: disable=not-an-iterable
+                    if not any((tag in task.tags for task in tasks)):
+                        mx.abort(f'Tag "{tag}" not part of any task.\n'
+                                 f'Run the following command to see all available tasks and their tags:\n'
+                                 f'  mx -v gate --dry-run')
+            elif len(Task.filters) > 0:
+                for f in Task.filters:
+                    if not any([f in t for task in tasks for t in [task.title] + task.legacyTitles]):
+                        mx.abort(f'Filter "{f}" does not match any task.\n'
+                                 f'Run the following command to see all available tasks and their tags:\n'
+                                 f'  mx -v gate --dry-run')
+            elif len(Task.strict_filters) > 0:
+                for f in Task.strict_filters:
+                    if not any([f == t for task in tasks for t in [task.title] + task.legacyTitles]):
+                        mx.abort(f'Strict filter "{f}" does not match any task.\n'
+                                 f'Run the following command to see all available tasks and their tags:\n'
+                                 f'  mx -v gate --dry-run')
     except KeyboardInterrupt:
         total.abort(1)
     except BaseException as e:
@@ -508,11 +547,22 @@ def _collect_tasks(cleanArgs, args):
         Task.log = prevLog
     return tasks
 
+
 def _run_mx_suite_tests():
     """
     Mx suite specific tests.
     """
     mx_javacompliance._test()
+
+    # Ensure mx_util.py only imports from the Python standard library
+    mx_util_py = join(dirname(__file__), 'mx_util.py')
+    with open(mx_util_py) as fp:
+        content = fp.read()
+        matches = list(re.finditer(r'(import +mx_|from +mx_)', content))
+        if matches:
+            nl = '\n'
+            violations = nl.join([f'line {content[0:m.start()].count(nl) + 1}: {m.group()}' for m in matches])
+            assert False, f'{mx_util_py} must only import from the Python standard library:{nl}{violations}'
 
     from tests import os_arch_tests
     os_arch_tests.tests()
@@ -536,6 +586,24 @@ def _run_mx_suite_tests():
         javaPreviewNeeded = JavaCompliance(k[2]) if k[2] else None
         actual = mx.JavacLikeCompiler.get_release_args(jdk_compliance, project_compliance, javaPreviewNeeded)
         assert actual == expect, f'{k}: {actual} != {expect}'
+
+
+    with tempfile.TemporaryDirectory(prefix="SafeFileCreation_test") as tmp_dir:
+        from multiprocessing import Process
+        cpus = mx.cpu_count()
+        processes = []
+        print(f'SafeFileCreation_test: starting {cpus} processes')
+        for _ in range(cpus):
+            p = Process(target=mx_util._create_tmp_files, args=(tmp_dir, 1000,))
+            p.start()
+            processes.append(p)
+        print(f'SafeFileCreation_test: joining {cpus} processes')
+        errors = 0
+        for p in processes:
+            p.join()
+            if p.exitcode != 0:
+                errors += 1
+        assert errors == 0, f'{errors} SafeFileCreation_test subprocesses exited with an error'
 
     if mx.is_windows():
         def win(s, min_length=0):
@@ -675,12 +743,9 @@ def _run_gate(cleanArgs, args, tasks):
             t.abort('Checkstyle warnings were found')
 
     with Task('SpotBugs', tasks, tags=[Tags.fullbuild]) as t:
-        if t and mx.command_function('spotbugs')([]) != 0:
+        _spotbugs_strict_mode = args.strict_mode and mx.primary_suite().getMxCompatibility().gate_spotbugs_strict_mode()
+        if t and mx.command_function('spotbugs')(['--strict-mode'] if _spotbugs_strict_mode else []) != 0:
             t.abort('FindBugs warnings were found')
-
-    with Task('VerifyLibraryURLs', tasks, tags=[Tags.fullbuild]) as t:
-        if t:
-            mx.command_function('verifylibraryurls')([])
 
     jacoco_exec = get_jacoco_dest_file()
     if exists(jacoco_exec):
@@ -791,6 +856,7 @@ def _jacoco_excludes_includes():
     for p in mx.projects():
         if p.isJavaProject():
             projsetting = getattr(p, 'jacoco', '')
+            assert isinstance(projsetting, str), f'jacoco must be a string, not a {type(projsetting)}'
             if not _jacoco_is_package_whitelisted(p.name):
                 pass
             elif projsetting == 'exclude':
@@ -800,6 +866,10 @@ def _jacoco_excludes_includes():
                 baseExcludes.append(p.name)
             elif projsetting == 'include':
                 includes.append(p.name + '.*')
+            packagelist = getattr(p, 'jacocoExcludePackages', [])
+            assert isinstance(packagelist, list), f'jacocoExcludePackages must be a list, not a {type(packagelist)}'
+            for packagename in packagelist:
+                baseExcludes.append(packagename)
     if _jacoco_whitelisted_packages:
         includes.extend((x + '.*' for x in _jacoco_whitelisted_packages))
 
@@ -823,7 +893,7 @@ def get_jacoco_dest_file():
     return JACOCO_EXEC or mx.get_opts().jacoco_dest_file
 
 def get_jacoco_agent_path(resolve):
-    return mx.library('JACOCOAGENT_0.8.9.202211161124').get_path(resolve)
+    return mx.library('JACOCOAGENT_0.8.10').get_path(resolve)
 
 def get_jacoco_agent_args(jacoco=None, agent_option_prefix=''):
     '''
@@ -942,6 +1012,9 @@ def _make_coverage_report(output_directory,
             if isinstance(p, mx.ClasspathDependency):
                 if omit_excluded and p.is_test_project():  # skip test projects when omit-excluded
                     continue
+                if not getattr(p, 'defaultBuild', True):   # skip projects that are not built by default
+                    if omit_excluded or not os.path.exists(p.classpath_repr(jdk)):
+                        continue
                 source_dirs = []
                 if p.isJavaProject():
                     if exclude_generated_sources:
@@ -1203,7 +1276,7 @@ def coverage_upload(args):
 
     with mx.Archiver(os.path.realpath(coverage_sources), kind='tgz') as sources, mx.Archiver(os.path.realpath(coverage_binaries), kind='tgz') as binaries:
         def _visit_deps(dep, edge):
-            if dep.isJavaProject() and not dep.is_test_project():
+            if dep.isJavaProject() and not dep.is_test_project() and getattr(dep, 'defaultBuild', True):
                 binaries.zf.add(dep.output_dir(), dep.name)
                 for d in dep.source_dirs():
                     sources.zf.add(d, dep.name)
@@ -1665,7 +1738,7 @@ def _unpack_test_results(test_results):
 
     return test_results
 
-def make_test_report(test_results, component=None, tags=None, fatalIfUploadFails=False):
+def make_test_report(test_results, task, component=None, tags=None, fatalIfUploadFails=False):
     """
     Creates a test report based on `test_results`. The report is a dict with the following fields:
         repo: simple name of git repository containing the primary suite (e.g., "graal")
@@ -1678,7 +1751,7 @@ def make_test_report(test_results, component=None, tags=None, fatalIfUploadFails
                 build = get_env('BUILD_NAME', 'unclassified')
                 comp = component or mx.primary_suite().name
             Example: "gate-test-java11-compiler-linux-amd64-vectorization_compiler"
-        tags: key/value pairs describing the test configuration. (e.g., {"task": "BootstrapWithSystemAssertions"})
+        tags: key/value pairs describing the test configuration. (e.g., {"gcc-version": "7.4"})
         tests: `test_results`
 
     If ${MX_TEST_REPORTS_LOCATION} is defined, then the report is uploaded as a gzipped JSON document
@@ -1704,6 +1777,7 @@ def make_test_report(test_results, component=None, tags=None, fatalIfUploadFails
                name: unique name for the test
                status: "PASSED", "FAILED" or "IGNORED"
                duration: duration of test in milliseconds
+    :param task: a name that can be used to differentiate between different configurations that run the same tests
     :param component: name of the tested component. Defaults to the name of the primary suite.
     :param tags: dict describing test details that make it unique compared to other test reports
              with the same `testCollection` value (e.g., {'task': 'XcompUnitTests: hosted-product compiler' }).
@@ -1720,6 +1794,9 @@ def make_test_report(test_results, component=None, tags=None, fatalIfUploadFails
     results_timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec='seconds')
     build = mx.get_env("BUILD_NAME", "unclassified")
 
+    if tags is None:
+        tags = dict()
+
     # Ensure tags has a job_type entry
     if 'job_type' not in tags:
         job_types = {"gate", "post-merge", "ondemand", "daily", "weekly", "bench"}
@@ -1735,6 +1812,7 @@ def make_test_report(test_results, component=None, tags=None, fatalIfUploadFails
         'arch': mx.get_arch(),
         'java_version': java_version,
         'component': component,
+        'task': task,
     }
     conflicting_tags = frozenset(predefined_tags.keys()).intersection(tags.keys())
     if conflicting_tags:
@@ -1751,6 +1829,10 @@ def make_test_report(test_results, component=None, tags=None, fatalIfUploadFails
         'tags': tags,
         'tests': test_results
     }
+
+    mandatory_tags = {'os', 'arch', 'java_version', 'component', 'job_type', 'task'}
+    missing_tags = frozenset(tags.keys()).difference(mandatory_tags)
+    assert len(missing_tags) == 0, f'The following mandatory tags are missing in the test report: {", ".join(missing_tags)}'
 
     upload_url_base = mx.get_env('MX_TEST_REPORTS_LOCATION')
     if upload_url_base is not None:

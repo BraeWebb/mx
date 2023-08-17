@@ -69,7 +69,7 @@ class JavaModuleDescriptor(mx.Comparable):
         self.requires = requires
         self.concealedRequires = concealedRequires if concealedRequires else {}
         self.uses = frozenset(uses)
-        self.opens = opens if opens else {}
+        self.opens = frozenset(opens if opens else [])
         self.provides = provides
         exportedPackages = frozenset(exports.keys())
         self.packages = exportedPackages if packages is None else frozenset(packages)
@@ -441,14 +441,14 @@ def get_library_as_module(dep, jdk):
     requires = {}
     exports = {}
     provides = {}
-    opens = {}
+    opens = set()
     uses = set()
     packages = set()
 
     for line in lines[1:]:
         parts = line.strip().split()
         assert len(parts) >= 2, '>>>'+line+'<<<'
-        if parts[0:2] == ['qualified', 'exports']:
+        if parts[0:2] == ['qualified', 'exports'] or parts[0:2] == ['qualified', 'opens']:
             parts = parts[1:]
         a = parts[0]
         if a == 'requires':
@@ -466,7 +466,8 @@ def get_library_as_module(dep, jdk):
         elif a == 'uses':
             uses.update(parts[1:])
         elif a == 'opens':
-            opens.update(parts[1:])
+            spec = " ".join(parts[1:])
+            opens.add(spec)
         elif a == 'contains':
             packages.update(parts[1:])
         elif a == 'provides':
@@ -480,7 +481,7 @@ def get_library_as_module(dep, jdk):
 
     if save:
         try:
-            with open(cache, 'w') as fp:
+            with mx.SafeFileCreation(cache) as sfc, open(sfc.tmpPath, 'w') as fp:
                 fp.write('\n'.join(lines) + '\n')
         except IOError as e:
             mx.warn('Error writing to ' + cache + ': ' + str(e))
@@ -691,16 +692,22 @@ def make_java_module(dist, jdk, archive, javac_daemon=None, alt_module_info_name
 
         mx.log(f'Building Java module {moduleName} ({basename(module_jar)}) from {dist.name}')
 
+        ignored_service_types = set()
         if module_info:
             for entry in module_info.get("requires", []):
                 parts = entry.split()
                 qualifiers = parts[0:-1]
                 name = parts[-1]
-                requires.setdefault(name, set()).update(qualifiers)
+                # override automatic qualifiers like transitive if they are explicitly specified in the module info
+                # this allows to customize the default behavior.
+                requires[name] = qualifiers
             base_uses.update(module_info.get('uses', []))
             _process_exports((alt_module_info or module_info).get('exports', []), module_packages)
 
             opens = module_info.get('opens', {})
+            ignored_service_types = module_info.get("ignoredServiceTypes", [])
+            if not isinstance(ignored_service_types, list):
+                mx.abort('"ignoredServiceTypes" must be a list', context=dist)
 
             requires_concealed = module_info.get('requiresConcealed', None)
             if requires_concealed is not None:
@@ -761,6 +768,11 @@ def make_java_module(dist, jdk, archive, javac_daemon=None, alt_module_info_name
                         _process_exports(getattr(library, 'exports'), library.defined_java_packages(), library)
                     if not module_info:
                         mx.warn("Module {} re-packages library {} but doesn't have a `moduleInfo` attribute. Note that library packages are not auto-exported")
+
+        # Add all modules imported by concealed requires to the list of requires.
+        for module in concealedRequires:
+            if module != 'java.base':
+                requires.setdefault(module, set())
 
         build_directory = mx.ensure_dir_exists(module_jar + ".build")
         try:
@@ -896,6 +908,14 @@ def make_java_module(dist, jdk, archive, javac_daemon=None, alt_module_info_name
                         for servicePathName in os.listdir(services_dir):
                             if servicePathName == _Archive.jdk_8268216:
                                 continue
+                            full_path = join(services_dir, servicePathName)
+                            if os.path.isdir(full_path):
+                                # Note: do not treat subdirectories of META-INF/services in any special way and just copy them to
+                                # the result as if they were just regular resource files. They are not part of the specification [1],
+                                # but some libraries are known to use them for internal purposes.
+                                # (e.g., the org.jline.terminal.spi.TerminalProvider class in JLine3).
+                                continue
+
                             # While a META-INF provider configuration file must use a fully qualified binary
                             # name[1] of the service, a provides directive in a module descriptor must use
                             # the fully qualified non-binary name[2] of the service.
@@ -903,9 +923,11 @@ def make_java_module(dist, jdk, archive, javac_daemon=None, alt_module_info_name
                             # [1] https://docs.oracle.com/javase/9/docs/api/java/util/ServiceLoader.html
                             # [2] https://docs.oracle.com/javase/9/docs/api/java/lang/module/ModuleDescriptor.Provides.html#service--
                             service = servicePathName.replace('$', '.')
+                            if service in ignored_service_types:
+                                continue
 
                             assert '/' not in service
-                            with open(join(services_dir, servicePathName)) as fp:
+                            with open(full_path) as fp:
                                 serviceContent = fp.read()
                             provides.setdefault(service, set()).update(provider.replace('$', '.') for provider in serviceContent.splitlines())
                             # Service types defined in the module are assumed to be used by the module

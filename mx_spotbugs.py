@@ -24,6 +24,7 @@
 #
 # ----------------------------------------------------------------------------------------------------
 #
+from argparse import ArgumentParser
 
 import mx
 import os
@@ -39,6 +40,8 @@ def _max_jdk_version_supported(spotbugs_version):
     Information is derived from https://github.com/spotbugs/spotbugs/blob/master/CHANGELOG.md
     """
     v = mx.VersionSpec(spotbugs_version)
+    if v >= mx.VersionSpec('4.7.3_JDK21_BACKPORT'):
+        return 21
     if v >= mx.VersionSpec('4.7.3'):
         return 20
     if v >= mx.VersionSpec('4.7.0'):
@@ -88,6 +91,12 @@ def _should_test_project(p):
             return False
     return True
 
+
+def _warn_or_abort(msg, strict_mode):
+    reporter = mx.abort if strict_mode else mx.warn
+    reporter(msg)
+
+
 def spotbugs(args, fbArgs=None, suite=None, projects=None, jarFileName='spotbugs.jar'):
     projectsToTest = [p for p in mx.projects() if _should_test_project(p)]
     projectsByVersion = {}
@@ -101,8 +110,12 @@ def spotbugs(args, fbArgs=None, suite=None, projects=None, jarFileName='spotbugs
         resultcode = max(resultcode, _spotbugs(args, fbArgs, suite, versionProjects, spotbugsVersion))
     return resultcode
 
-def _spotbugs(args, fbArgs, suite, projectsToTest, spotbugsVersion):
+def _spotbugs(all_args, fbArgs, suite, projectsToTest, spotbugsVersion):
     """run FindBugs against non-test Java projects"""
+    parser = ArgumentParser(prog='mx spotbugs')
+    parser.add_argument('--strict-mode', action='store_true', help='abort if a spotbugs cannot be executed due some reason (e.g., unsupported JDK version)')
+    parsed_args, args = parser.parse_known_args(all_args)
+
     findBugsHome = mx.get_env('SPOTBUGS_HOME', mx.get_env('FINDBUGS_HOME', None))
     if spotbugsVersion == '3.0.0':
         jarFileName = 'findbugs.jar'
@@ -168,11 +181,17 @@ def _spotbugs(args, fbArgs, suite, projectsToTest, spotbugsVersion):
 
     outputDirs = [mx._cygpathU2W(p.output_dir()) for p in projectsToTest]
     javaCompliance = max([p.javaCompliance for p in projectsToTest])
-    jdk = mx.get_jdk(javaCompliance)
     max_jdk_version = _max_jdk_version_supported(spotbugsVersion)
-    if max_jdk_version < jdk.javaCompliance.value:
-        mx.warn(f'Spotbugs {spotbugsVersion} only runs on JDK {max_jdk_version} or lower, not {jdk}. Skipping {projectsToTest}')
+    if max_jdk_version < javaCompliance.value:
+        _warn_or_abort(
+            f'Spotbugs {spotbugsVersion} only runs on JDK {max_jdk_version} or lower, not {javaCompliance}. Skipping {projectsToTest}',
+            parsed_args.strict_mode)
         return 0
+    def _abort(msg):
+        mx.log_error(f'No JDK compatible with Spotbugs found')
+        mx.abort(msg)
+    _range = f'{javaCompliance.value}..{max_jdk_version}' if javaCompliance.value < max_jdk_version else str(max_jdk_version)
+    jdk = mx.get_jdk(_range, abortCallback=_abort)
 
     spotbugsResults = join(suite.dir, 'spotbugs.results')
 

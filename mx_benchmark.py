@@ -36,6 +36,7 @@ import uuid
 import tempfile
 import shutil
 import zipfile
+import shlex
 from argparse import ArgumentParser
 from argparse import RawTextHelpFormatter
 from argparse import SUPPRESS
@@ -353,6 +354,7 @@ class BenchmarkSuite(object):
         self._desired_version = None
         self._suite_dimensions = {}
         self._command_mapper_hooks = []
+        self._trackers = []
         self._currently_running_benchmark = None
 
     def name(self):
@@ -431,6 +433,15 @@ class BenchmarkSuite(object):
         :return: None
         """
         self._command_mapper_hooks.append((name, func, self))
+
+    def register_tracker(self, name, tracker_type):
+        tracker = tracker_type(self)
+        self._trackers.append(tracker)
+
+        def hook(cmd, suite):
+            assert suite == self
+            return tracker.map_command(cmd)
+        self.register_command_mapper_hook(name, hook)
 
     def version(self):
         """The suite version selected for execution which is either the :defaultSuiteVerion:
@@ -1120,7 +1131,10 @@ class StdOutBenchmarkSuite(BenchmarkSuite):
             return []
 
         datapoints = []
-        rules = self.rules(out, benchmarks, bmSuiteArgs) + _get_trackers_rules(self, bmSuiteArgs) + extraRules
+        rules = self.rules(out, benchmarks, bmSuiteArgs)
+        for t in self._trackers:
+            rules += t.get_rules(bmSuiteArgs)
+        rules += extraRules
 
         for rule in rules:
             # pass working directory to rule without changing the signature of parse
@@ -1775,7 +1789,7 @@ class OutputCapturingJavaVm(OutputCapturingVm): #pylint: disable=R0921
                                 vm_info["platform.jvmci-version"] = m.group(1)
                         if "GraalVM" in jdk_version_string:
                             # Until 19.3.0 the following format used to exist: 'GraalVM LIBGRAAL_CE_BASH 19.3.0'
-                            m = re.search(r'GraalVM (?P<edition>CE |EE |LIBGRAAL_CE_BASH | LIBGRAAL_EE_BASH )?(?P<version>(\.?\d+)*)', jdk_version_string)
+                            m = re.search(r'(?P<oracle>Oracle )?GraalVM (?P<edition>CE |EE |LIBGRAAL_CE_BASH | LIBGRAAL_EE_BASH )?(?P<version>(\.?\d+)*)', jdk_version_string)
                             if m:
                                 vm_info["platform.graalvm-version-string"] = m.group(0).strip()
                                 vm_info["platform.graalvm-version"] = m.group('version').strip()
@@ -1785,6 +1799,8 @@ class OutputCapturingJavaVm(OutputCapturingVm): #pylint: disable=R0921
                                         vm_info["platform.graalvm-edition"] = "CE"
                                     elif "EE" in m.group('edition').upper():
                                         vm_info["platform.graalvm-edition"] = "EE"
+                                elif m.group('oracle'):
+                                    vm_info["platform.graalvm-edition"] = "EE"
                                 else:
                                     # Edition may be absent from the version string. 'GraalVM 22.0.0-dev' is valid
                                     vm_info["platform.graalvm-edition"] = "unknown"
@@ -2545,55 +2561,6 @@ def build_url():
     return ""
 
 
-def get_rss_parse_rule(suite, bmSuiteArgs):
-    if mx_benchmark_compatibility().bench_suite_needs_suite_args():
-        suite_name = suite.benchSuiteName(bmSuiteArgs)
-    else:
-        suite_name = suite.benchSuiteName()
-    if mx.get_os() == "linux":
-        # Output of 'time -v' on linux contains:
-        #        Maximum resident set size (kbytes): 511336
-        rule = [
-            StdOutRule(
-                r"Maximum resident set size \(kbytes\): (?P<rss>[0-9]+)",
-                {
-                    "benchmark": suite.currently_running_benchmark(),
-                    "bench-suite": suite_name,
-                    "config.vm-flags": ' '.join(suite.vmArgs(bmSuiteArgs)),
-                    "metric.name": "max-rss",
-                    "metric.value": ("<rss>", lambda x: int(float(x)/(1024))),
-                    "metric.unit": "MB",
-                    "metric.type": "numeric",
-                    "metric.score-function": "id",
-                    "metric.better": "lower",
-                    "metric.iteration": 0
-                }
-            )
-        ]
-    elif mx.get_os() == "darwin":
-        # Output of 'time -l' on linux contains (size in bytes):
-        #  523608064  maximum resident set size
-        rule = [
-            StdOutRule(
-                r"(?P<rss>[0-9]+)\s+maximum resident set size",
-                {
-                    "benchmark": suite.currently_running_benchmark(),
-                    "bench-suite": suite_name,
-                    "config.vm-flags": ' '.join(suite.vmArgs(bmSuiteArgs)),
-                    "metric.name": "max-rss",
-                    "metric.value": ("<rss>", lambda x: int(float(x)/(1024*1024))),
-                    "metric.unit": "MB",
-                    "metric.type": "numeric",
-                    "metric.score-function": "id",
-                    "metric.better": "lower",
-                    "metric.iteration": 0
-                }
-            )
-        ]
-    else:
-        rule = []
-    return rule
-
 _use_tracker = True
 
 def enable_tracker():
@@ -2604,58 +2571,178 @@ def disable_tracker():
     global _use_tracker
     _use_tracker = False
 
-def rss_hook(cmd, bmSuite):
-    """
-    Tracks the max resident memory size used by the process using the 'time' command.
+class Tracker(object):
+    def __init__(self, bmSuite):
+        self.bmSuite = bmSuite
 
-    :param list[str] cmd: the input command to modify
-    :param BenchmarkSuite bmSuite: the benchmark suite to which this command corresponds to if any
-    :return:
-    """
-    if not _use_tracker:
-        return cmd
-    if mx.get_os() == "linux":
-        prefix = ["time", "-v"]
-    elif mx.get_os() == "darwin":
-        prefix = ["time", "-l"]
-    else:
-        mx.log(f"Ignoring the 'rss' tracker since it is not supported on {mx.get_os()}")
-        prefix = []
-    return prefix + cmd
+    def map_command(self, cmd):
+        raise NotImplementedError()
+
+    def get_rules(self, bmSuiteArgs):
+        raise NotImplementedError()
+
+class RssTracker(Tracker):
+    def map_command(self, cmd):
+        """
+        Tracks the max resident memory size used by the process using the 'time' command.
+
+        :param list[str] cmd: the input command to modify
+        :return:
+        """
+        if not _use_tracker:
+            return cmd
+        if mx.get_os() == "linux":
+            prefix = ["time", "-v"]
+        elif mx.get_os() == "darwin":
+            prefix = ["time", "-l"]
+        else:
+            mx.log(f"Ignoring the 'rss' tracker since it is not supported on {mx.get_os()}")
+            prefix = []
+        return prefix + cmd
+
+    def get_rules(self, bmSuiteArgs):
+        if mx_benchmark_compatibility().bench_suite_needs_suite_args():
+            suite_name = self.bmSuite.benchSuiteName(bmSuiteArgs)
+        else:
+            suite_name = self.bmSuite.benchSuiteName()
+        if mx.get_os() == "linux":
+            # Output of 'time -v' on linux contains:
+            #        Maximum resident set size (kbytes): 511336
+            rules = [
+                StdOutRule(
+                    r"Maximum resident set size \(kbytes\): (?P<rss>[0-9]+)",
+                    {
+                        "benchmark": self.bmSuite.currently_running_benchmark(),
+                        "bench-suite": suite_name,
+                        "config.vm-flags": ' '.join(self.bmSuite.vmArgs(bmSuiteArgs)),
+                        "metric.name": "max-rss",
+                        "metric.value": ("<rss>", lambda x: int(float(x)/(1024))),
+                        "metric.unit": "MB",
+                        "metric.type": "numeric",
+                        "metric.score-function": "id",
+                        "metric.better": "lower",
+                        "metric.iteration": 0
+                    }
+                )
+            ]
+        elif mx.get_os() == "darwin":
+            # Output of 'time -l' on linux contains (size in bytes):
+            #  523608064  maximum resident set size
+            rules = [
+                StdOutRule(
+                    r"(?P<rss>[0-9]+)\s+maximum resident set size",
+                    {
+                        "benchmark": self.bmSuite.currently_running_benchmark(),
+                        "bench-suite": suite_name,
+                        "config.vm-flags": ' '.join(self.bmSuite.vmArgs(bmSuiteArgs)),
+                        "metric.name": "max-rss",
+                        "metric.value": ("<rss>", lambda x: int(float(x)/(1024*1024))),
+                        "metric.unit": "MB",
+                        "metric.type": "numeric",
+                        "metric.score-function": "id",
+                        "metric.better": "lower",
+                        "metric.iteration": 0
+                    }
+                )
+            ]
+        else:
+            rules = []
+        return rules
 
 
-def psrecord_hook(cmd, bmSuite):
-    """
-    Delegates the command execution to 'psrecord' that will also capture memory and CPU consumption of the process.
+class PsrecordTracker(Tracker):
+    def __init__(self, bmSuite):
+        super().__init__(bmSuite)
+        self.most_recent_text_output = None
 
-    :param list[str] cmd: the input command to modify
-    :param BenchmarkSuite bmSuite: the benchmark suite to which this command corresponds to if any
-    :return:
-    """
-    if not _use_tracker:
-        return cmd
+    def map_command(self, cmd):
+        """
+        Delegates the command execution to 'psrecord' that will also capture memory and CPU consumption of the process.
 
-    if mx.run(["psrecord", "-h"], nonZeroIsFatal=False, out=mx.OutputCapture(), err=mx.OutputCapture()) != 0:
-        mx.abort("Memory tracking requires the 'psrecord' dependency. Install it with: 'pip install psrecord'")
+        :param list[str] cmd: the input command to modify
+        """
+        if not _use_tracker:
+            self.most_recent_text_output = None
+            return cmd
 
-    import datetime
-    bench_name = bmSuite.currently_running_benchmark() if bmSuite else "benchmark"
-    if bmSuite:
-        bench_name = f"{bmSuite.name()}-{bench_name}"
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    text_output = os.path.join(os.getcwd(), f"ps_{bench_name}_{ts}.txt")
-    plot_output = os.path.join(os.getcwd(), f"ps_{bench_name}_{ts}.png")
-    return ["psrecord", "--log", text_output, "--plot", plot_output, "--include-children", " ".join(cmd)]
+        import datetime
+        bench_name = self.bmSuite.currently_running_benchmark() if self.bmSuite else "benchmark"
+        if self.bmSuite:
+            bench_name = f"{self.bmSuite.name()}-{bench_name}"
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        text_output = os.path.join(os.getcwd(), f"ps_{bench_name}_{ts}.txt")
+        plot_output = os.path.join(os.getcwd(), f"ps_{bench_name}_{ts}.png")
+        if mx.run(["psrecord", "-h"], nonZeroIsFatal=False, out=mx.OutputCapture(), err=mx.OutputCapture()) != 0:
+            mx.abort("Memory tracking requires the 'psrecord' dependency. Install it with: 'pip install psrecord'")
+
+        self.most_recent_text_output = text_output
+        cmd_string = " ".join(shlex.quote(arg) for arg in cmd)
+        return ["psrecord", "--interval", "0.1", "--log", text_output, "--plot", plot_output, "--include-children", cmd_string]
+
+    def get_rules(self, bmSuiteArgs):
+        return [PsrecordTracker.PsrecordRule(self, bmSuiteArgs)]
+
+    class PsrecordRule(CSVBaseRule):
+        def __init__(self, tracker, bmSuiteArgs, **kwargs):
+            replacement = {
+                "benchmark": tracker.bmSuite.currently_running_benchmark(),
+                "bench-suite": tracker.bmSuite.benchSuiteName(bmSuiteArgs) if mx_benchmark_compatibility().bench_suite_needs_suite_args() else tracker.bmSuite.benchSuiteName(),
+                "config.vm-flags": ' '.join(tracker.bmSuite.vmArgs(bmSuiteArgs)),
+                "metric.name": ("<metric_name>", str),
+                "metric.value": ("<metric_value>", int),
+                "metric.unit": "MB",
+                "metric.type": "numeric",
+                "metric.score-function": "id",
+                "metric.better": "lower",
+                "metric.iteration": 0
+            }
+            super().__init__(["elapsed-wall", "cpu%", "rss_mb", "vsz_mb"],
+                             replacement, delimiter=' ', skipinitialspace=True, **kwargs)
+            self.tracker = tracker
+
+        def getCSVFiles(self, text):
+            file = self.tracker.most_recent_text_output
+            return [file] if file else []
+
+        def parseResults(self, text):
+            rows = super().parseResults(text)
+            rows = rows[1:]  # first row contains malformatted (unquoted) headings
+            if not rows:
+                return []
+            values = sorted(float(r["rss_mb"]) for r in rows)
+
+            def pc(k): # k-percentile with linear interpolation between closest ranks
+                x = (len(values) - 1) * k / 100
+                fr = int(x)
+                cl = int(x + 0.5)
+                v = values[fr] if fr == cl else values[fr] * (cl - x) + values[cl] * (x - fr)
+                return {"metric_name": "rss_p" + str(k), "metric_value": str(int(v))}
+
+            return [pc(100), pc(99), pc(95), pc(90), pc(75), pc(50), pc(25)]
+
+
+class PsrecordMaxrssTracker(Tracker):
+    """Uses both `time` for exact maximum RSS and `psrecord` for percentiles from sampling."""
+
+    def __init__(self, bmSuite):
+        super().__init__(bmSuite)
+        self.rss = RssTracker(bmSuite)
+        self.psrecord = PsrecordTracker(bmSuite)
+
+    def map_command(self, cmd):
+        # Note that psrecord tracks the metrics of the `time` tool as well, which adds 1-2M of RSS.
+        # Vice versa, `time` would track psrecord's Python interpreter, which adds more than 10M.
+        return self.psrecord.map_command(self.rss.map_command(cmd))
+
+    def get_rules(self, bmSuiteArgs):
+        return self.rss.get_rules(bmSuiteArgs) + self.psrecord.get_rules(bmSuiteArgs)
 
 
 _available_trackers = {
-    "rss": rss_hook,
-    "psrecord": psrecord_hook
+    "rss": RssTracker,
+    "psrecord": PsrecordTracker,
+    "psrecord+maxrss": PsrecordMaxrssTracker,
 }
-
-
-def _get_trackers_rules(suite, bmSuiteArgs):
-    return get_rss_parse_rule(suite, bmSuiteArgs)
 
 
 class BenchmarkExecutor(object):
@@ -2770,6 +2857,9 @@ class BenchmarkExecutor(object):
           "metric.score-function": "id",
           "warnings": "",
         }
+
+        if mx.get_env("MACHINE_CONFIG_HASH", default=None):
+            standard.update({"machine.config-hash": mx.get_env("MACHINE_CONFIG_HASH")[:7]})
 
         standard.update(suite.suiteDimensions())
         standard.update(self.extras(mxBenchmarkArgs))
@@ -2953,148 +3043,160 @@ class BenchmarkExecutor(object):
         parser.add_argument(
             "--hwloc-bind", type=str, default=None, help="A space-separated string of one or more arguments that should passed to 'hwloc-bind'.")
         parser.add_argument(
+            "--deferred-tty", action="store_true", default=None,
+            help="Print the output of the benchmark in one block at the end.")
+        parser.add_argument(
             "-h", "--help", action="store_true", default=None,
             help="Show usage information.")
         mxBenchmarkArgs = parser.parse_args(mxBenchmarkArgs)
 
-        suite = None
-        if mxBenchmarkArgs.benchmark:
-            # The suite will read the benchmark specifier,
-            # and therewith produce a list of benchmark sets to run in separate forks.
-            # Later, the harness passes each set of benchmarks from this list to the suite separately.
-            suite, benchNamesList = self.getSuiteAndBenchNames(mxBenchmarkArgs, bmSuiteArgs)
+        out = None
+        err = None
+        if mxBenchmarkArgs.deferred_tty:
+            out = OutputDump(sys.stdout)
+            err = OutputDump(sys.stderr)
+
+        with TTYCapturing(out=out, err=err):
+            suite = None
+            if mxBenchmarkArgs.benchmark:
+                # The suite will read the benchmark specifier,
+                # and therewith produce a list of benchmark sets to run in separate forks.
+                # Later, the harness passes each set of benchmarks from this list to the suite separately.
+                suite, benchNamesList = self.getSuiteAndBenchNames(mxBenchmarkArgs, bmSuiteArgs)
 
 
-        if mxBenchmarkArgs.hwloc_bind:
-            suite.register_command_mapper_hook("hwloc-bind", make_hwloc_bind(mxBenchmarkArgs.hwloc_bind))
+            if mxBenchmarkArgs.hwloc_bind:
+                suite.register_command_mapper_hook("hwloc-bind", make_hwloc_bind(mxBenchmarkArgs.hwloc_bind))
 
-        if mxBenchmarkArgs.tracker == 'none':
-            mxBenchmarkArgs.tracker = None
+            if mxBenchmarkArgs.tracker == 'none':
+                mxBenchmarkArgs.tracker = None
 
-        if mxBenchmarkArgs.tracker:
-            if mxBenchmarkArgs.tracker not in _available_trackers:
-                raise ValueError(f"Unknown tracker '{mxBenchmarkArgs.tracker}'. Use one of: {', '.join(_available_trackers.keys())}")
-            if suite:
-                mx.log(f"Registering tracker: {mxBenchmarkArgs.tracker}")
-                suite.register_command_mapper_hook(mxBenchmarkArgs.tracker,
-                                                   _available_trackers[mxBenchmarkArgs.tracker])
+            if mxBenchmarkArgs.tracker:
+                if mxBenchmarkArgs.tracker not in _available_trackers:
+                    raise ValueError(f"Unknown tracker '{mxBenchmarkArgs.tracker}'. Use one of: {', '.join(_available_trackers.keys())}")
+                if suite:
+                    mx.log(f"Registering tracker: {mxBenchmarkArgs.tracker}")
+                    suite.register_tracker(mxBenchmarkArgs.tracker, _available_trackers[mxBenchmarkArgs.tracker])
 
-        if mxBenchmarkArgs.list:
-            if mxBenchmarkArgs.benchmark and suite:
-                print(f"The following benchmarks are available in suite {suite.name()}:\n")
-                for name in suite.benchmarkList(bmSuiteArgs):
-                    print("  " + name)
-                if isinstance(suite, VmBenchmarkSuite):
-                    print(f"\n{suite.get_vm_registry().get_available_vm_configs_help()}")
-            else:
-                vmregToSuites = {}
-                noVmRegSuites = []
-                for bm_suite_name, bm_suite in sorted([(k, v) for k, v in _bm_suites.items() if v]):
-                    if isinstance(bm_suite, VmBenchmarkSuite):
-                        vmreg = bm_suite.get_vm_registry()
-                        vmregToSuites.setdefault(vmreg, []).append(bm_suite_name)
-                    else:
-                        noVmRegSuites.append(bm_suite_name)
-                for vmreg, bm_suite_names in vmregToSuites.items():
-                    print(f"\nThe following {vmreg.vm_type_name} benchmark suites are available:\n")
-                    for name in bm_suite_names:
+            if mxBenchmarkArgs.list:
+                if mxBenchmarkArgs.benchmark and suite:
+                    print(f"The following benchmarks are available in suite {suite.name()}:\n")
+                    for name in suite.benchmarkList(bmSuiteArgs):
                         print("  " + name)
-                    print(f"\n{vmreg.get_available_vm_configs_help()}")
-                if noVmRegSuites:
-                    print("\nThe following non-VM benchmark suites are available:\n")
-                    for name in noVmRegSuites:
-                        print("  " + name)
-            return 0
-
-        if mxBenchmarkArgs.help or mxBenchmarkArgs.benchmark is None:
-            parser.print_help()
-            for key, entry in parsers.items():
-                if mxBenchmarkArgs.benchmark is None or key in suite.parserNames():
-                    print(entry.description)
-                    entry.parser.print_help()
-            for vmreg in vm_registries():
-                print(f"\n{vmreg.get_available_vm_configs_help()}")
-            return 0 if mxBenchmarkArgs.help else 1
-
-        self.checkEnvironmentVars()
-
-        results = []
-
-        # The fork-counts file can be used to specify how many times to repeat the whole fork of the benchmark.
-        # For simplicity, this feature is only supported if the benchmark harness invokes each benchmark in the suite separately
-        # (i.e. when the harness does not ask the suite to run a set of benchmarks within the same process).
-        fork_count_spec = None
-        if mxBenchmarkArgs.fork_count_file:
-            with open(mxBenchmarkArgs.fork_count_file) as f:
-                fork_count_spec = json.load(f)
-        failures_seen = False
-        failed_benchmarks = []
-        try:
-            suite.before(bmSuiteArgs)
-            skipped_benchmark_forks = []
-            ignored_benchmarks = []
-            for benchnames in benchNamesList:
-                suite.validateEnvironment()
-                fork_count = 1
-                if fork_count_spec and benchnames and len(benchnames) == 1:
-                    fork_count = fork_count_spec.get(f"{suite.name()}:{benchnames[0]}")
-                    if fork_count is None and benchnames[0] in fork_count_spec:
-                        mx.log(f"[FORKS] Found a fallback entry '{benchnames[0]}' in the fork counts file. Please use the full benchmark name instead: '{suite.name()}:{benchnames[0]}'")
-                        fork_count = fork_count_spec.get(benchnames[0])
-                elif fork_count_spec and len(suite.benchmarkList(bmSuiteArgs)) == 1:
-                    # single benchmark suites executed by providing the suite name only or a wildcard
-                    fork_count = fork_count_spec.get(suite.name(), fork_count_spec.get(f"{suite.name()}:*"))
-                elif fork_count_spec:
-                    mx.abort("The 'fork count' feature is only supported when the suite runs each benchmark in a fresh VM.\nYou might want to use: mx benchmark <options> '<benchmark-suite>:*'")
-                if fork_count_spec and fork_count is None:
-                    mx.log(f"[FORKS] Skipping benchmark '{suite.name()}:{benchnames[0]}' since there is no value for it in the fork count file.")
-                    skipped_benchmark_forks.append(f"{suite.name()}:{benchnames[0]}")
+                    if isinstance(suite, VmBenchmarkSuite):
+                        print(f"\n{suite.get_vm_registry().get_available_vm_configs_help()}")
                 else:
-                    for fork_num in range(0, fork_count):
-                        if fork_count_spec:
-                            mx.log(f"Execution of fork {fork_num + 1}/{fork_count}")
-                        try:
-                            if benchnames and len(benchnames) > 0 and not benchnames[0] in suite.benchmarkList(bmSuiteArgs) and benchnames[0] in suite.completeBenchmarkList(bmSuiteArgs):
-                                mx.log(f"Skipping benchmark '{suite.name()}:{benchnames[0]}' since it isn't supported on the current platform/configuration.")
-                                ignored_benchmarks.append(f"{suite.name()}:{benchnames[0]}")
-                            else:
-                                expandedBmSuiteArgs = suite.expandBmSuiteArgs(benchnames, bmSuiteArgs)
-                                for variant_num, suiteArgs in enumerate(expandedBmSuiteArgs):
-                                    mx.log(f"Execution of variant {variant_num + 1}/{len(expandedBmSuiteArgs)} with suite args: {suiteArgs}")
-                                    results.extend(self.execute(suite, benchnames, mxBenchmarkArgs, suiteArgs, fork_number=fork_num))
-                        except (BenchmarkFailureError, RuntimeError):
-                            failures_seen = True
-                            failed_benchmarks.append(f"{suite.name()}:{benchnames[0]}")
-                            mx.log(traceback.format_exc())
-                            if mxBenchmarkArgs.fail_fast:
-                                mx.abort("Aborting execution since a failure happened and --fail-fast is enabled")
-            nl_tab = '\n\t'
-            if ignored_benchmarks:
-                mx.log(f"Benchmarks ignored since they aren't supported on the current platform/configuration:{nl_tab}{nl_tab.join(ignored_benchmarks)}")
-            if skipped_benchmark_forks:
-                mx.log(f"[FORKS] Benchmarks skipped since they have no entry in the fork counts file:{nl_tab}{nl_tab.join(skipped_benchmark_forks)}")
-        finally:
+                    vmregToSuites = {}
+                    noVmRegSuites = []
+                    for bm_suite_name, bm_suite in sorted([(k, v) for k, v in _bm_suites.items() if v]):
+                        if isinstance(bm_suite, VmBenchmarkSuite):
+                            vmreg = bm_suite.get_vm_registry()
+                            vmregToSuites.setdefault(vmreg, []).append(bm_suite_name)
+                        else:
+                            noVmRegSuites.append(bm_suite_name)
+                    for vmreg, bm_suite_names in vmregToSuites.items():
+                        print(f"\nThe following {vmreg.vm_type_name} benchmark suites are available:\n")
+                        for name in bm_suite_names:
+                            print("  " + name)
+                        print(f"\n{vmreg.get_available_vm_configs_help()}")
+                    if noVmRegSuites:
+                        print("\nThe following non-VM benchmark suites are available:\n")
+                        for name in noVmRegSuites:
+                            print("  " + name)
+                return 0
+
+            if mxBenchmarkArgs.help or mxBenchmarkArgs.benchmark is None:
+                parser.print_help()
+                for key, entry in parsers.items():
+                    if mxBenchmarkArgs.benchmark is None or key in suite.parserNames():
+                        print(entry.description)
+                        entry.parser.print_help()
+                for vmreg in vm_registries():
+                    print(f"\n{vmreg.get_available_vm_configs_help()}")
+                return 0 if mxBenchmarkArgs.help else 1
+
+            self.checkEnvironmentVars()
+
+            results = []
+
+            # The fork-counts file can be used to specify how many times to repeat the whole fork of the benchmark.
+            # For simplicity, this feature is only supported if the benchmark harness invokes each benchmark in the suite separately
+            # (i.e. when the harness does not ask the suite to run a set of benchmarks within the same process).
+            fork_count_spec = None
+            if mxBenchmarkArgs.fork_count_file:
+                with open(mxBenchmarkArgs.fork_count_file) as f:
+                    fork_count_spec = json.load(f)
+            failures_seen = False
+            failed_benchmarks = []
             try:
-                suite.after(bmSuiteArgs)
-            except RuntimeError:
-                failures_seen = True
-                mx.log(traceback.format_exc())
+                suite.before(bmSuiteArgs)
+                skipped_benchmark_forks = []
+                ignored_benchmarks = []
+                for benchnames in benchNamesList:
+                    suite.validateEnvironment()
+                    fork_count = 1
+                    if fork_count_spec and benchnames and len(benchnames) == 1:
+                        fork_count = fork_count_spec.get(f"{suite.name()}:{benchnames[0]}")
+                        if fork_count is None and benchnames[0] in fork_count_spec:
+                            mx.log(f"[FORKS] Found a fallback entry '{benchnames[0]}' in the fork counts file. Please use the full benchmark name instead: '{suite.name()}:{benchnames[0]}'")
+                            fork_count = fork_count_spec.get(benchnames[0])
+                    elif fork_count_spec and len(suite.benchmarkList(bmSuiteArgs)) == 1:
+                        # single benchmark suites executed by providing the suite name only or a wildcard
+                        fork_count = fork_count_spec.get(suite.name(), fork_count_spec.get(f"{suite.name()}:*"))
+                    elif fork_count_spec:
+                        mx.abort("The 'fork count' feature is only supported when the suite runs each benchmark in a fresh VM.\nYou might want to use: mx benchmark <options> '<benchmark-suite>:*'")
+                    if fork_count_spec and fork_count is None:
+                        mx.log(f"[FORKS] Skipping benchmark '{suite.name()}:{benchnames[0]}' since there is no value for it in the fork count file.")
+                        skipped_benchmark_forks.append(f"{suite.name()}:{benchnames[0]}")
+                    else:
+                        for fork_num in range(0, fork_count):
+                            if fork_count_spec:
+                                mx.log(f"Execution of fork {fork_num + 1}/{fork_count}")
+                            try:
+                                if benchnames and len(benchnames) > 0 and not benchnames[0] in suite.benchmarkList(bmSuiteArgs) and benchnames[0] in suite.completeBenchmarkList(bmSuiteArgs):
+                                    mx.log(f"Skipping benchmark '{suite.name()}:{benchnames[0]}' since it isn't supported on the current platform/configuration.")
+                                    ignored_benchmarks.append(f"{suite.name()}:{benchnames[0]}")
+                                else:
+                                    expandedBmSuiteArgs = suite.expandBmSuiteArgs(benchnames, bmSuiteArgs)
+                                    for variant_num, suiteArgs in enumerate(expandedBmSuiteArgs):
+                                        mx.log(f"Execution of variant {variant_num + 1}/{len(expandedBmSuiteArgs)} with suite args: {suiteArgs}")
+                                        results.extend(self.execute(suite, benchnames, mxBenchmarkArgs, suiteArgs, fork_number=fork_num))
+                            except (BenchmarkFailureError, RuntimeError):
+                                failures_seen = True
+                                if benchnames and len(benchnames) > 0:
+                                    failed_benchmarks.append(f"{suite.name()}:{benchnames[0]}")
+                                else:
+                                    failed_benchmarks.append(f"{suite.name()}")
+                                mx.log(traceback.format_exc())
+                                if mxBenchmarkArgs.fail_fast:
+                                    mx.abort("Aborting execution since a failure happened and --fail-fast is enabled")
+                nl_tab = '\n\t'
+                if ignored_benchmarks:
+                    mx.log(f"Benchmarks ignored since they aren't supported on the current platform/configuration:{nl_tab}{nl_tab.join(ignored_benchmarks)}")
+                if skipped_benchmark_forks:
+                    mx.log(f"[FORKS] Benchmarks skipped since they have no entry in the fork counts file:{nl_tab}{nl_tab.join(skipped_benchmark_forks)}")
+            finally:
+                try:
+                    suite.after(bmSuiteArgs)
+                except RuntimeError:
+                    failures_seen = True
+                    mx.log(traceback.format_exc())
 
-        if not returnSuiteAndResults:
-            suite.dump_results_file(mxBenchmarkArgs.results_file, results)
-        else:
-            mx.log("Skipping benchmark results dumping since they're programmatically returned")
+            if not returnSuiteAndResults:
+                suite.dump_results_file(mxBenchmarkArgs.results_file, results)
+            else:
+                mx.log("Skipping benchmark results dumping since they're programmatically returned")
 
-        exit_code = 0
-        if failures_seen:
-            mx.log_error(f"Failures happened during benchmark(s) execution !"
-                         f"The following benchmarks failed:{nl_tab}{nl_tab.join(failed_benchmarks)}")
-            exit_code = 1
+            exit_code = 0
+            if failures_seen:
+                mx.log_error(f"Failures happened during benchmark(s) execution !"
+                             f"The following benchmarks failed:{nl_tab}{nl_tab.join(failed_benchmarks)}")
+                exit_code = 1
 
-        if returnSuiteAndResults:
-            return exit_code, suite, results
-        else:
-            return exit_code
+            if returnSuiteAndResults:
+                return exit_code, suite, results
+            else:
+                return exit_code
 
 def make_hwloc_bind(hwloc_bind_args):
     if mx.run(["hwloc-bind", "--version"], nonZeroIsFatal=False, out=mx.OutputCapture(), err=mx.OutputCapture()) != 0:
@@ -3189,6 +3291,12 @@ def benchmark(args, returnSuiteAndResults=False):
     """
     mxBenchmarkArgs, bmSuiteArgs = splitArgs(args, "--")
     return _benchmark_executor.benchmark(mxBenchmarkArgs, bmSuiteArgs, returnSuiteAndResults=returnSuiteAndResults)
+
+class OutputDump:
+    def __init__(self, out):
+        self.out = out
+    def __call__(self, data):
+        self.out.write(data)
 
 class TTYCapturing(object):
     def __init__(self, out=None, err=None):

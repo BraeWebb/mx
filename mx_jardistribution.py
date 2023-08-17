@@ -32,7 +32,7 @@ import time
 import re
 import pickle
 
-from os.path import join, exists, basename, dirname, isdir, islink
+from os.path import join, exists, basename, dirname, isdir, islink, realpath
 from argparse import ArgumentTypeError
 from stat import S_IMODE
 
@@ -68,14 +68,15 @@ class JARDistribution(mx.Distribution, mx.ClasspathDependency):
            or only API documentation. Accepted values are "implementation" and "API".
     :param bool allowsJavadocWarnings: specifies whether warnings are fatal when javadoc is generated
     :param bool maven:
+    :param bool useModulePath: put this distribution and all its dependencies on the module-path.
     :param dict[str, str] | None manifestEntries: Entries for the `META-INF/MANIFEST.MF` file.
     """
     def __init__(self, suite, name, subDir, path, sourcesPath, deps, mainClass, excludedLibs, distDependencies, javaCompliance, platformDependent, theLicense,
-                 javadocType="implementation", allowsJavadocWarnings=False, maven=True, stripConfigFileNames=None,
+                 javadocType="implementation", allowsJavadocWarnings=False, maven=True, useModulePath=False, stripConfigFileNames=None,
                  stripMappingFileNames=None, manifestEntries=None, alwaysStrip=None, **kwArgs):
         assert manifestEntries is None or isinstance(manifestEntries, dict)
         mx.Distribution.__init__(self, suite, name, deps + distDependencies, excludedLibs, platformDependent, theLicense, **kwArgs)
-        mx.ClasspathDependency.__init__(self, **kwArgs)
+        mx.ClasspathDependency.__init__(self, use_module_path=useModulePath, **kwArgs)
         self.subDir = subDir
         if path:
             path = mx_subst.path_substitutions.substitute(path)
@@ -119,6 +120,8 @@ class JARDistribution(mx.Distribution, mx.ClasspathDependency):
             # when the library is lazily resolved by build tasks (which can be running
             # concurrently).
             self.buildDependencies.extend((l.suite.name + ':' + l.name for l in mx.classpath_entries('PROGUARD_BASE_' + self.suite.getMxCompatibility().proguard_libs()['BASE'])))
+        if useModulePath and self.get_declaring_module_name() is None:
+            mx.abort('The property useModulePath is set to True but the distribution does not contain a module specification. Add a "moduleInfo" attribute with a name to resolve this.', context=self)
 
     def post_init(self):
         # paths are initialized late to be able to figure out the max jdk
@@ -325,6 +328,9 @@ class JARDistribution(mx.Distribution, mx.ClasspathDependency):
             jmd = mx.make_java_module(self, jdk, stager.bin_archive, javac_daemon=javac_daemon)
             if jmd:
                 setattr(self, '.javaModule', jmd)
+                mi_file = self._module_info_save_file()
+                with mx.open(mi_file, 'w') as fp:
+                    fp.write(self._module_info_as_json())
                 dependency_file = self._jmod_build_jdk_dependency_file()
                 with mx.open(dependency_file, 'w') as fp:
                     fp.write(jdk.home)
@@ -364,9 +370,16 @@ class JARDistribution(mx.Distribution, mx.ClasspathDependency):
     def strip_jar(self):
         assert self.is_stripped()
 
-        jdk = mx.get_jdk(tag='default')
-        if jdk.javaCompliance.value > self.suite.getMxCompatibility().proguard_supported_jdk_version() and mx.get_opts().proguard_cp is None:
-            mx.abort(f'Cannot strip {self} - ProGuard does not yet support JDK {jdk.javaCompliance}')
+        def _abort(*args, **kwargs):
+            mx.log_error(f'No JDK compatible with ProGuard found')
+            mx.abort(*args, **kwargs)
+
+        max_java_compliance = self.maxJavaCompliance().value
+        proguard_jdk_version = self.suite.getMxCompatibility().proguard_supported_jdk_version()
+        if max_java_compliance > proguard_jdk_version and mx.get_opts().proguard_cp is None:
+            mx.abort(f'Cannot strip {self} - ProGuard does not yet support JDK {max_java_compliance}')
+        _range = f'{max_java_compliance}..{proguard_jdk_version}' if max_java_compliance != proguard_jdk_version else str(max_java_compliance)
+        jdk = mx.get_jdk(_range, abortCallback=_abort)
 
         mx.logv(f'Stripping {self.name}...')
         jdk9_or_later = jdk.javaCompliance >= '9'
@@ -562,6 +575,20 @@ class JARDistribution(mx.Distribution, mx.ClasspathDependency):
         """
         return self.original_path() + '.jdk'
 
+    def _module_info_save_file(self):
+        """
+        Gets the path to the file saving `_module_info_as_json()`.
+        """
+        return self.original_path() + '.module-info'
+
+    def _module_info_as_json(self):
+        """
+        Gets the moduleInfo attribute(s) as sorted json.
+        """
+        import json
+        module_infos = {name:getattr(self, name) for name in dir(self) if name == 'moduleInfo' or name.startswith('moduleInfo:')}
+        return json.dumps(module_infos, sort_keys=True, indent=2)
+
     def needsUpdate(self, newestInput):
         res = mx._needsUpdate(newestInput, self.path)
         if res:
@@ -590,8 +617,20 @@ class JARDistribution(mx.Distribution, mx.ClasspathDependency):
                 res = mx._needsUpdate(self.original_path(), pickle_path)
                 if res:
                     return res
-                # Rebuild the jmod file if different JDK used previously
                 jdk = mx.get_jdk(compliance)
+
+                # Rebuild if module info changed
+                mi_file = self._module_info_save_file()
+                if exists(mi_file):
+                    module_info = self._module_info_as_json()
+                    with mx.open(mi_file) as fp:
+                        saved_module_info = fp.read()
+                    if module_info != saved_module_info:
+                        import difflib
+                        mx.log(f'{self} module info changed:' + os.linesep + ''.join(difflib.unified_diff(saved_module_info.splitlines(1), module_info.splitlines(1))))
+                        return 'module-info changed'
+
+                # Rebuild the jmod file if different JDK used previously
                 dependency_file = self._jmod_build_jdk_dependency_file()
                 if exists(dependency_file):
                     with mx.open(dependency_file) as fp:
@@ -814,9 +853,13 @@ class _ArchiveStager(object):
                     continue
                 if not is_sources_jar and arcname == 'module-info.class':
                     mx.logv(jar_path + ' contains ' + arcname + '. It will not be included in ' + self.bin_archive.path)
-                elif not is_sources_jar and arcname.startswith('META-INF/services/') and not arcname == 'META-INF/services/':
-                    service = arcname[len('META-INF/services/'):]
-                    assert '/' not in service
+                    continue
+                service = arcname[len('META-INF/services/'):]
+                if not is_sources_jar and arcname.startswith('META-INF/services/') and not arcname == 'META-INF/services/' and '/' not in service:
+                    # Note: do not treat subdirectories of META-INF/services in any special way and just copy them to
+                    # the result as if they were just regular resource files. They are not part of the specification,
+                    # but some libraries are known to use them for internal purposes.
+                    # (e.g., the org.jline.terminal.spi.TerminalProvider class in JLine3).
                     self.services.setdefault(service, []).extend(zf.read(arcname).decode().splitlines())
                 else:
                     entry = _ArchiveEntry(dep, arcname, archive, jar_path + '!' + arcname)
@@ -1022,6 +1065,11 @@ class _ArchiveStager(object):
             for f in dep.getResults():
                 relpath = dep.get_relpath(f, outputDir)
                 self.add_file(dep, outputDir, relpath, archivePrefix)
+        elif dep.isLayoutDirDistribution():
+            mx.logv('[' + original_path + ': adding contents of layout dir distribution ' + dep.name + ']')
+            output = realpath(dep.get_output())
+            for _, p in dep.getArchivableResults():
+                self.add_file(dep, output, p, '')
         elif dep.isClasspathDependency():
             mx.logv('[' + original_path + ': adding classpath ' + dep.name + ']')
             jarPath = dep.classpath_repr(resolve=True)
@@ -1301,7 +1349,7 @@ class _ArchiveEntry(object):
                 else:
                     # right is a normal file
                     left = left_zf.read(left_info)
-                    with open(right, 'rb') as fp:
+                    with open(right[0], 'rb') as fp:
                         right = fp.read()
                         if left == right:
                             return None
@@ -1315,7 +1363,7 @@ class _ArchiveEntry(object):
                     right = right_zf.read(right[1])
             else:
                 # right is a normal file
-                with open(right, 'rb') as fp:
+                with open(right[0], 'rb') as fp:
                     right = fp.read()
             if left == right:
                 return None

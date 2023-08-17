@@ -1,92 +1,86 @@
-local common = import "common.json";
-local jdks = common.jdks;
+local common = import "ci/common.jsonnet";
 local versions = {
-    python3: "3.8.10",
-    pylint: "2.4.4",
     gcc: "4.9.2",
-    ruby: "2.7.2",
-    git: "1.8.3",
-    devtoolset: "7",
     make: "3.83",
-    binutils: "2.34",
     capstone: "4.0.2",
 };
-local catch_files = common.catch_files + [
+local extra_catch_files = [
   "Cannot decode '(?P<filename>[^']+)'"
 ];
-
-# this uses <os>_<arch> or <os> depending on what field is available in 'common.json'
-# if 'common.json' is migrated to jsonnet, we could simplify this by providing reasonable defaults there
-local deps(project, os, arch) = if std.objectHasAll(common[project].deps, os) then common.sulong.deps[os] else common.sulong.deps[os + "_" + arch];
+local remove_mx_from_packages(obj) = obj + {
+    # Exclude mx from packages
+    packages: {
+        [key]: obj.packages[key]
+        for key in std.objectFields(obj.packages) if key != "mx"
+    },
+};
 
 # Common configuration for all gates. Specific gates are defined
 # by the functions at the bottom of this object.
 #
 # This structure allows for easily changing the
 # platform details of a gate builder.
-local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch) + {
+local with(platform, java_release, timelimit="15:00") = {
+    local os = platform.os,
+    local arch = platform.arch,
     local path(unixpath) = if os == "windows" then std.strReplace(unixpath, "/", "\\") else unixpath,
     local exe(unixpath) = if os == "windows" then path(unixpath) + ".exe" else unixpath,
     local copydir(src, dst) = if os == "windows" then ["xcopy", path(src), path(dst), "/e", "/i", "/q"] else ["cp", "-r", src, dst],
     local mx_copy_dir = path("${PWD}/../path with a space"),
     local mx = path("./mx"),
-    local openssl102_for_ruby = if os == "linux" && arch == "amd64" then {
-      docker: {
-        image: "phx.ocir.io/oraclelabs2/c_graal/buildslave:buildslave_ol7",
-        mount_modules: true,
-      },
+    local jdk = common.jdks["labsjdk-ee-%s" % java_release],
+    local eclipse_dep = if arch == "amd64" then common.deps.eclipse + {
+        environment+: {
+            ECLIPSE_EXE: if os == "darwin" then "$ECLIPSE/Contents/MacOS/eclipse" else exe("$ECLIPSE/eclipse")
+        }
+    } else {
+        # No CI Eclipse packages available on AArch64
+    },
+
+    local base = platform + jdk + eclipse_dep + common.deps.pylint + common.deps.sulong + common.deps.svm + {
+        # Creates a builder name in "top down" order: first "what it is" (e.g. gate) then Java version followed by OS and arch
+        name: "%s-jdk%s-%s-%s" % [self.prefix, java_release, os, arch],
+        targets: ["gate"],
+        catch_files+: extra_catch_files,
+        timelimit: timelimit,
+        setup: [
+            # Copy mx to a directory with a space in its name to ensure
+            # mx can work in that context.
+            copydir("$PWD", mx_copy_dir),
+            ["cd", mx_copy_dir],
+        ] + if os == "darwin" && eclipse_dep != {} then [
+            # Need to remove the com.apple.quarantine attribute from Eclipse otherwise
+            # it will fail to start on later macOS versions.
+            ["xattr", "-d", "-r", "com.apple.quarantine", "${ECLIPSE}"],
+        ] else [],
+
+        java_home_in_env(suite_dir, suite_name):: [
+            # Set JAVA_HOME *only* in <suite_dir>/mx.<suite>/env
+            ["python3", "-c", "import os; open(r'" + path(suite_dir + "/mx.%s/env" % suite_name) + "', 'w').write('JAVA_HOME=' + os.environ['JAVA_HOME'])"],
+            ["unset", "JAVA_HOME"],
+        ],
+    },
+
+    with_name(prefix):: base + {
+        prefix:: prefix,
+    } + if prefix != "version-update-check" && prefix != "verify-graal-common-sync" then {
+        requireArtifacts: [
+            {name: "version-update-check"},
+            {name: "verify-graal-common-sync"}
+        ],
     } else {},
-
-    # Creates a builder name in "top down" order: first "what it is" (e.g. gate) then Java version followed by OS and arch
-    with_name(prefix):: self + {
-        name: "%s-jdk%s-%s-%s" % [prefix, java_release, os, arch],
-    },
-
-    catch_files: catch_files,
-
-    python_version: "3",
-    targets: ["gate"],
-    capabilities: [os, arch],
-    packages+: {
-        "pip:pylint": "==" + versions.pylint,
-        "gcc": "==" + versions.gcc,
-        "python3": "==" + versions.python3,
-    },
-    downloads+: common.downloads.eclipse.downloads + {
-        JAVA_HOME: jdks["labsjdk-ee-%s" % java_release]
-    },
-    environment: {
-        ECLIPSE_EXE: if os == "darwin" then "$ECLIPSE/Contents/MacOS/eclipse" else exe("$ECLIPSE/eclipse"),
-        # Required to keep pylint happy on Darwin
-        # https://coderwall.com/p/-k_93g/mac-os-x-valueerror-unknown-locale-utf-8-in-python
-        LC_ALL: "en_US.UTF-8",
-    },
-    timelimit: timelimit,
-    setup: [
-        # Copy mx to a directory with a space in its name to ensure
-        # mx can work in that context.
-        copydir("$PWD", mx_copy_dir),
-        ["cd", mx_copy_dir],
-    ] + if os == "darwin" then [
-        # Need to remove the com.apple.quarantine attribute from Eclipse otherwise
-        # it will fail to start on later macOS versions.
-        ["xattr", "-d", "-r", "com.apple.quarantine", "${ECLIPSE}"],
-    ] else [],
-
-    java_home_in_env(suite_dir, suite_name):: [
-        # Set JAVA_HOME *only* in <suite_dir>/mx.<suite>/env
-        ["python3", "-c", "import os; open(r'" + path(suite_dir + "/mx.%s/env" % suite_name) + "', 'w').write('JAVA_HOME=' + os.environ['JAVA_HOME'])"],
-        ["unset", "JAVA_HOME"],
-    ],
 
     # Specific gate builders are defined by the following functions
 
     gate:: self.with_name("gate") + {
         environment+: {
+            MX_ALT_OUTPUT_ROOT: path("$BUILD_DIR/alt_output_root"),
             JDT: "builtin",
         },
         run: self.java_home_in_env(".", "mx") + [
-            [mx, "--strict-compliance", "gate", "--strict-mode"] + if os == "windows" then ["--tags", "fullbuild"] else [],
+            [mx, "--strict-compliance", "gate"]
+            + (if eclipse_dep != {} then ["--strict-mode"] else [])
+            + (if os == "windows" then ["--tags", "fullbuild"] else []),
         ],
     },
 
@@ -123,12 +117,19 @@ local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch)
             [mx, "-p", "../graal/compiler", "profpackage", "gate-xcomp"],
             [mx, "-p", "../graal/compiler", "profhot", "gate-xcomp.zip"],
             [mx, "-p", "../graal/compiler", "profhot", "gate-xcomp"],
+            [mx, "-p", "../graal/compiler", "profjson", "gate-xcomp", "-o", "prof_gate_xcomp.json"],
             [mx, "-p", "../graal/compiler", "benchmark", "dacapo:fop", "--tracker", "none", "--", "--profiler", "proftool"],
             [mx, "-p", "../graal/compiler", "profpackage", "-n", "proftool_fop_*"],
             [mx, "-p", "../graal/compiler", "profhot", "proftool_fop_*"],
             [mx, "-p", "../graal/compiler", "benchmark", "scala-dacapo:tmt", "--tracker", "none", "--", "--profiler", "proftool"],
             [mx, "-p", "../graal/compiler", "profpackage", "-D", "proftool_tmt_*"],
-            [mx, "-p", "../graal/compiler", "profhot", "-c", "1", "-s", "proftool_tmt_*"]
+            [mx, "-p", "../graal/compiler", "profhot", "-c", "1", "-s", "proftool_tmt_*"],
+            [mx, "-p", "../graal/vm", "--env", "ni-ce", "build"],
+            [mx, "-p", "../graal/vm", "--env", "ni-ce", "benchmark", "renaissance-native-image:scrabble", "--tracker", "none", "--", "--jvm=native-image", "--jvm-config=default-ce", "--profiler", "proftool"],
+            [mx, "profjson", "proftool_scrabble_*", "-o", "prof_scrabble.json"],
+            [mx, "profhot", "proftool_scrabble_*"],
+            [mx, "profrecord", "-E", "profrecord_scrabble", "../graal/vm/mxbuild/native-image-benchmarks/renaissance-*-scrabble-default-ce/renaissance-*-scrabble-default-ce", "scrabble"],
+            [mx, "profhot", "profrecord_scrabble"]
         ]
     },
 
@@ -136,10 +137,8 @@ local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch)
         local base_dir = "./fetch-jdk-test-folder",
 
         run: [
-            [mx, "fetch-jdk", "--jdk-id", "labsjdk-ce-19", "--to", base_dir, "--alias", "jdk-19"],
-            [exe(base_dir + "/jdk-19/bin/java"), "-version"],
-            [mx, "fetch-jdk", "--jdk-id", "labsjdk-ce-17", "--to", base_dir, "--alias", "jdk-17"],
-            [exe(base_dir + "/jdk-17/bin/java"), "-version"],
+            [mx, "fetch-jdk", "--jdk-id", "labsjdk-ce-%s" % java_release, "--to", base_dir, "--alias", "jdk-%s" % java_release],
+            [exe(base_dir + "/jdk-%s/bin/java" % java_release), "-version"],
         ],
         teardown: [
             ["rm", "-rf", "$base_dir"],
@@ -160,11 +159,7 @@ local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch)
         ],
     },
 
-    build_truffleruby:: self.with_name("gate-build-truffleruby") + deps("sulong", os, arch) + openssl102_for_ruby + {
-        packages+: {
-            ruby: ">=" + versions.ruby,
-            python3: "==" + versions.python3,
-        },
+    build_truffleruby:: self.with_name("gate-build-truffleruby") + common.deps.sulong + common.deps.truffleruby + {
         environment+: {
             PATH: "$BUILD_DIR/main:$PATH", # add ./mx on PATH
         },
@@ -176,13 +171,9 @@ local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch)
         ],
     },
 
-    build_graalvm_ce:: self.with_name("gate-build-graalvm-ce") + deps("sulong", os, arch) + {
+    build_graalvm_ce:: self.with_name("gate-build-graalvm-ce") + common.deps.sulong + {
         packages+: {
-            git: ">=" + versions.git,
-            devtoolset: "==" + versions.devtoolset,
             make: ">=" + versions.make,
-            binutils: "==" + versions.binutils,
-            python3: "==" + versions.python3,
         },
         run: [
             [mx, "sclone", "--kind", "git", "--source", "https://github.com/oracle/graal.git", "--dest", "../graal"],
@@ -201,15 +192,26 @@ local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch)
     },
 
     version_update_check:: self.with_name("version-update-check") + {
+        publishArtifacts: [
+          {
+            name: "version-update-check",
+            patterns: ["version-update-check.ok"]
+          }
+        ],
         run: [
-            [ path("./tag_version.py"), "--check-only", "HEAD" ],
+            [ path("./ci/check_version.py") ],
+            [ "touch", "$PWD/version-update-check.ok" ]
         ],
     },
 
+    # Applies and pushes a tag equal to `mx version` if no such
+    # tag already exists.
     post_merge_tag_version:: self.with_name("post-merge-tag-version") + {
       targets: ["post-merge"],
       run: [
-          [ path("./tag_version.py"), "HEAD" ],
+          ["set-export", "MX_NEW_TAG", [mx, "version"]],
+          ["git", "show", "$MX_NEW_TAG", "||", "git", "tag", "$MX_NEW_TAG", "HEAD"],
+          ["git", "push", "origin", "$MX_NEW_TAG"],
       ],
       notify_groups:: ["mx_git_tag"]
     }
@@ -219,25 +221,29 @@ local with(os, arch, java_release, timelimit="15:00") = deps("sulong", os, arch)
     specVersion: "3",
 
     # Overlay
-    overlay: "b83990a5afcd4d1e527125c572ecd7e060748f05",
+    overlay: "ac39d70172b1327e73fde446dad6341727340376",
 
     # For use by overlay
     versions:: versions,
-    catch_files:: catch_files,
+    extra_catch_files:: extra_catch_files,
+    primary_jdk_version:: 21,
+    secondary_jdk_version:: 20,
 
-    builds: [
-        with("linux",   "amd64", 19).gate,
-        with("linux",   "amd64", 19).fetchjdk_test,
-        with("linux",   "amd64", 19).bisect_test,
-        with("windows", "amd64", 19).gate,
-        with("darwin",  "amd64", 19, timelimit="25:00").gate,
-        with("linux",   "amd64", 19).bench_test,
-        with("linux",   "amd64", 19).jmh_test,
-        with("linux",   "amd64", 19, timelimit="20:00").proftool_test,
-        with("linux",   "amd64", 19, timelimit="20:00").build_truffleruby,
-        with("linux",   "amd64", 19, timelimit="20:00").build_graalvm_ce,
-        with("linux",   "amd64", 19).mx_unit_test,
-        with("linux",   "amd64", 19).version_update_check,
-        with("linux",   "amd64", 19).post_merge_tag_version,
-    ]
+    local builds = [
+        with(common.linux_amd64, self.primary_jdk_version).gate,
+        with(common.linux_amd64, self.primary_jdk_version).fetchjdk_test,
+        with(common.linux_amd64, self.primary_jdk_version).bisect_test,
+        with(common.windows_amd64, self.primary_jdk_version).gate,
+        with(common.darwin_amd64, self.primary_jdk_version, timelimit="25:00").gate,
+        with(common.darwin_aarch64, self.primary_jdk_version).gate,
+        with(common.linux_amd64, self.primary_jdk_version).bench_test,
+        with(common.linux_amd64, self.primary_jdk_version).jmh_test,
+        with(common.linux_amd64, self.primary_jdk_version, timelimit="30:00").proftool_test,
+        with(common.linux_amd64, self.primary_jdk_version, timelimit="20:00").build_truffleruby,
+        with(common.linux_amd64, self.primary_jdk_version, timelimit="20:00").build_graalvm_ce,
+        with(common.linux_amd64, self.primary_jdk_version).mx_unit_test,
+        with(common.linux_amd64, self.primary_jdk_version).version_update_check,
+        with(common.linux_amd64, self.primary_jdk_version).post_merge_tag_version,
+    ],
+    builds: [remove_mx_from_packages(b) for b in builds],
 }
