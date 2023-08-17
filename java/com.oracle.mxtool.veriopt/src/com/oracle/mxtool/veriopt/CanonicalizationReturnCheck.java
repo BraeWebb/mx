@@ -75,7 +75,7 @@ public class CanonicalizationReturnCheck extends AbstractCheck {
         }
 
         DetailAST commentContent = lastAST.findFirstToken(TokenTypes.COMMENT_CONTENT);
-        if (!commentContent.getText().stripLeading().startsWith("veriopt")) {
+        if (!commentContent.getText().trim().startsWith("veriopt")) {
             log(lastAST, "Canonicalization documentation not in correct form: " + commentContent.getText());
         }
     }

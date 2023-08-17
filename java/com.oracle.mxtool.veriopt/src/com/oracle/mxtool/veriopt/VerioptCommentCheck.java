@@ -38,7 +38,7 @@ public class VerioptCommentCheck extends AbstractCheck {
     @Override
     public void visitToken(DetailAST ast) {
         String commentContents = ast.getText();
-        if (!commentContents.stripLeading().startsWith("veriopt")) {
+        if (!commentContents.trim().startsWith("veriopt")) {
             return;
         }
 

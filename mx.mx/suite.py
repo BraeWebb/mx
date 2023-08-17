@@ -160,7 +160,7 @@ suite = {
       "maven" : {
         "groupId" : "junit",
         "artifactId" : "junit",
-        "version" : "4.12",
+        "version" : "4.13.1",
       }
     },
 
