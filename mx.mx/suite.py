@@ -145,7 +145,7 @@ suite = {
     },
 
     "JUNIT" : {
-      "digest": "sha512:5974670c3d178a12da5929ba5dd9b4f5ff461bdc1b92618c2c36d53e88650df7adbf3c1684017bb082b477cb8f40f15dcf7526f06f06183f93118ba9ebeaccce",
+      "digest": "sha512:29769fb462c7db2fcca6de3a24b445ae252a7570950f9a2163e14c478f854e47056444d90b2d40f4cf4e3f37c03faacf694c2db12763e173c44362af50176b1f",
       "sourceDigest": "sha512:5c36f1671b1567919baa633e01765cf8e67c75f37f52876e11f764e3fccfa7b3c2b4cf2214b8956fd58a06f502694c80a208e8b88bcaca3893fc9c62820322a2",
       "dependencies" : ["HAMCREST"],
       "licence" : "CPL",
